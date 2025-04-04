@@ -33,7 +33,7 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o";
 const TIMELINE_SUMMARY_OBJECT_API_NAME = "Timeline_Summary__c"; // Salesforce object API name
-const DIRECT_INPUT_THRESHOLD = 5000; // Max activities for direct JSON input in prompt
+const DIRECT_INPUT_THRESHOLD = 2000; // Max activities for direct JSON input in prompt
 const TEMP_FILE_DIR = path.join(__dirname, 'temp_files'); // Directory for temporary files
 
 // --- Environment Variable Validation ---
@@ -642,7 +642,7 @@ async function generateSummary(
 
 
             // --- Check length against the threshold ---
-            if (potentialFullPrompt.length < PROMPT_LENGTH_THRESHOLD) {
+            if (potentialFullPrompt.length < PROMPT_LENGTH_THRESHOLD && activities.length <= DIRECT_INPUT_THRESHOLD) {
                 // --- Method: Direct JSON Input ---
                 inputMethod = "direct JSON";
                 finalUserPrompt = potentialFullPrompt; // Use the combined prompt
