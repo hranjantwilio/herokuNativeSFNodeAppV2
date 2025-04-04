@@ -637,8 +637,9 @@ async function generateSummary(
                 console.log(`[Thread ${thread.id}] Using file upload (${activities.length} activities >= ${DIRECT_INPUT_THRESHOLD}).`);
                 // Create a temporary local file
                 const timestamp = new Date().toISOString().replace(/[:.-]/g, "_");
-                const filename = `temp_activities_${timestamp}_${thread.id}.json`;
-                filePath = path.join(TEMP_FILE_DIR); // Store in the temp directory
+                const filename = `salesforce_activities_${timestamp}_${thread.id}.json`;
+                //filePath = path.join(TEMP_FILE_DIR); // Store in the temp directory
+                filePath = path.join(__dirname, filename);
                 await fs.ensureDir(path.dirname(filePath)); // Ensure the temp directory exists
                 await fs.writeJson(filePath, activities); // Write activities array as JSON
                 console.log(`[Thread ${thread.id}] Temporary file generated: ${filePath}`);
