@@ -601,48 +601,82 @@ async function processSummary(
     }
 }
 
+
 // --- OpenAI Summary Generation Function ---
 async function generateSummary(
     activities, // Array of raw activities OR null (if data is already embedded in prompt)
     openaiClient,
     assistantId, // Accepts the ID dynamically
-    userPrompt,
+    userPrompt, // The base user prompt template
     functionSchema // The specific function schema object for this call
 ) {
     let fileId = null;
     let thread = null;
     let filePath = null; // For temporary file path
     let inputMethod = "prompt"; // Default input method
+    const PROMPT_LENGTH_THRESHOLD = 256000; // Define the character limit
 
     try {
         // Step 1: Create an OpenAI Thread
         thread = await openaiClient.beta.threads.create();
         console.log(`[Thread ${thread.id}] Created for Assistant ${assistantId}`);
 
-        let finalUserPrompt = userPrompt; // Base prompt
+        let finalUserPrompt = userPrompt; // Start with the base prompt
         let messageAttachments = []; // Attachments for the message (e.g., file IDs)
 
-        // Step 2: Determine Input Method based on activities array
+        // Step 2: Determine Input Method based on activities array AND prompt length
         if (activities && Array.isArray(activities) && activities.length > 0) {
-            if (activities.length < DIRECT_INPUT_THRESHOLD) {
+            // --- Tentatively construct the prompt with direct JSON ---
+            let potentialFullPrompt;
+            let activitiesJsonString;
+            try {
+                 // Stringify first to check length accurately
+                 activitiesJsonString = JSON.stringify(activities, null, 2); // Pretty print adds some length
+                 potentialFullPrompt = `${userPrompt}\n\nHere is the activity data to process:\n\`\`\`json\n${activitiesJsonString}\n\`\`\``;
+                 console.log(`[Thread ${thread.id}] Potential prompt length with direct JSON: ${potentialFullPrompt.length} characters.`);
+            } catch(stringifyError) {
+                console.error(`[Thread ${thread.id}] Error stringifying activities for length check:`, stringifyError);
+                // Decide how to handle - perhaps default to file upload or throw
+                throw new Error("Failed to stringify activity data for processing.");
+            }
+
+
+            // --- Check length against the threshold ---
+            if (potentialFullPrompt.length < PROMPT_LENGTH_THRESHOLD) {
                 // --- Method: Direct JSON Input ---
                 inputMethod = "direct JSON";
-                console.log(`[Thread ${thread.id}] Using direct JSON input (${activities.length} activities < ${DIRECT_INPUT_THRESHOLD}).`);
-                const activitiesJsonString = JSON.stringify(activities, null, 2); // Pretty print for AI readability
-                // Append the JSON data directly to the prompt content
-                finalUserPrompt += `\n\nHere is the activity data to process:\n\`\`\`json\n${activitiesJsonString}\n\`\`\``;
+                finalUserPrompt = potentialFullPrompt; // Use the combined prompt
+                console.log(`[Thread ${thread.id}] Using direct JSON input (Prompt length ${potentialFullPrompt.length} < ${PROMPT_LENGTH_THRESHOLD}).`);
+                // No file upload needed, messageAttachments remains empty
+
             } else {
-                // --- Method: File Upload Input ---
+                // --- Method: File Upload Input (Prompt too long) ---
                 inputMethod = "file upload";
-                console.log(`[Thread ${thread.id}] Using file upload (${activities.length} activities >= ${DIRECT_INPUT_THRESHOLD}).`);
-                // Create a temporary local file
+                console.log(`[Thread ${thread.id}] Using file upload (Potential prompt length ${potentialFullPrompt.length} >= ${PROMPT_LENGTH_THRESHOLD}).`);
+                // **IMPORTANT**: Use the *original* base userPrompt, not the one with JSON appended
+                finalUserPrompt = userPrompt;
+
+                 // --- Convert activities to Plain Text for file_search compatibility ---
+                let activitiesText = activities.map((activity, index) => {
+                    let activityLines = [`Activity ${index + 1}:`];
+                    for (const [key, value] of Object.entries(activity)) {
+                        let displayValue = typeof value === 'object' ? JSON.stringify(value) : value;
+                        activityLines.push(`  ${key}: ${displayValue}`);
+                    }
+                    return activityLines.join('\n');
+                }).join('\n\n---\n\n');
+                // ---------------------------------------------------------------------
+
+                // Create a temporary local file (.txt extension)
                 const timestamp = new Date().toISOString().replace(/[:.-]/g, "_");
-                const filename = `salesforce_activities_${timestamp}_${thread.id}.json`;
-                //filePath = path.join(TEMP_FILE_DIR); // Store in the temp directory
-                filePath = path.join(__dirname, filename);
-                await fs.ensureDir(path.dirname(filePath)); // Ensure the temp directory exists
-                await fs.writeJson(filePath, activities); // Write activities array as JSON
-                console.log(`[Thread ${thread.id}] Temporary file generated: ${filePath}`);
+                // *** USE .txt EXTENSION ***
+                const filename = `salesforce_activities_${timestamp}_${thread.id}.txt`;
+                filePath = path.join(__dirname, filename); // Or TEMP_FILE_DIR
+                await fs.ensureDir(path.dirname(filePath)); // Ensure directory exists
+
+                // *** WRITE THE TEXT STRING ***
+                await fs.writeFile(filePath, activitiesText);
+                console.log(`[Thread ${thread.id}] Temporary text file generated: ${filePath}`);
 
                 // Upload the file to OpenAI
                 const uploadResponse = await openaiClient.files.create({
@@ -653,17 +687,20 @@ async function generateSummary(
                 console.log(`[Thread ${thread.id}] File uploaded to OpenAI: ${fileId}`);
 
                 // Prepare attachment for the message, linking the file and specifying the tool
+                // *** Ensure file_search is used if that's the intent for large data ***
                 messageAttachments.push({ file_id: fileId, tools: [{ type: "file_search" }] });
+                console.log(`[Thread ${thread.id}] Attaching file ${fileId} with file_search tool.`);
             }
         } else {
-             // Case where activities is null or empty (e.g., quarterly call)
+             // Case where activities is null or empty (e.g., quarterly call where data is already in prompt)
              console.log(`[Thread ${thread.id}] No activities array provided or array is empty. Using prompt content as is.`);
+             // finalUserPrompt is already set to userPrompt, messageAttachments is empty
         }
 
         // Step 3: Add the User Message to the Thread
         const messagePayload = {
             role: "user",
-            content: finalUserPrompt, // Use the potentially modified prompt
+            content: finalUserPrompt, // Use the final prompt (either base or combined)
         };
         if (messageAttachments.length > 0) {
             messagePayload.attachments = messageAttachments;
@@ -677,71 +714,60 @@ async function generateSummary(
         const run = await openaiClient.beta.threads.runs.createAndPoll(thread.id, {
             assistant_id: assistantId,
             // IMPORTANT: Pass ONLY the required function schema in tools for this specific run
+            // Note: If using file_search, the assistant might *also* need the file_search tool enabled here or at assistant level
+            // Let's assume the assistant *already has* file_search enabled if needed. We only specify the function tool for this run's *primary* action.
             tools: [{ type: "function", function: functionSchema }],
             // Explicitly tell the Assistant it MUST call this specific function
             tool_choice: { type: "function", function: { name: functionSchema.name } },
-            // temperature: 0 // Optional: Set temperature to 0 for more deterministic output format
         });
         console.log(`[Thread ${thread.id}] Run status: ${run.status}`);
 
-        // Step 5: Process the Run Outcome
+        // Step 5: Process the Run Outcome (No changes needed here from previous version)
         if (run.status === 'requires_action') {
-            // Check if the required action involves the expected tool call
             const toolCalls = run.required_action?.submit_tool_outputs?.tool_calls;
             if (!toolCalls || toolCalls.length === 0) {
-                console.error(`[Thread ${thread.id}] Run requires action, but tool call data is missing or empty.`, run);
-                throw new Error("Function call was expected but not provided correctly by the Assistant.");
-            }
-
-            // Assuming only one tool call is expected per run in this setup
-            const toolCall = toolCalls[0];
-
-            // Verify the correct function was called (important sanity check)
-            if (toolCall.function.name !== functionSchema.name) {
-                 console.error(`[Thread ${thread.id}] Assistant called the wrong function. Expected: ${functionSchema.name}, Got: ${toolCall.function.name}`);
-                 throw new Error(`Assistant called the wrong function: ${toolCall.function.name}`);
-            }
-
-            const rawArgs = toolCall.function.arguments;
-            console.log(`[Thread ${thread.id}] Function call arguments received for ${toolCall.function.name}. Raw (truncated): ${rawArgs.substring(0,200)}...`);
-            try {
-                // Parse the JSON arguments returned by the function call
-                const summaryObj = JSON.parse(rawArgs);
-                console.log(`[Thread ${thread.id}] Successfully parsed function arguments.`);
-                // We don't need to submit back tool outputs here, just return the parsed arguments
-                return summaryObj;
-            } catch (parseError) {
-                console.error(`[Thread ${thread.id}] Failed to parse function call arguments JSON:`, parseError);
-                console.error(`[Thread ${thread.id}] Raw arguments received:`, rawArgs);
-                throw new Error(`Failed to parse function call arguments from AI: ${parseError.message}`);
-            }
-        } else if (run.status === 'completed') {
-             // This is unexpected when tool_choice forces a function
-             console.warn(`[Thread ${thread.id}] Run completed without requiring function call action, despite tool_choice forcing ${functionSchema.name}. Check Assistant instructions or prompt clarity.`);
-             // Log the last message to understand what happened
-             const messages = await openaiClient.beta.threads.messages.list(run.thread_id, { limit: 1 });
-             const lastMessageContent = messages.data[0]?.content[0]?.text?.value || "No text content found.";
-             console.warn(`[Thread ${thread.id}] Last message content from Assistant: ${lastMessageContent}`);
-             throw new Error(`Assistant run completed without making the required function call to ${functionSchema.name}.`);
-        } else {
-            // Handle other terminal statuses: 'failed', 'cancelled', 'expired'
-            console.error(`[Thread ${thread.id}] Run failed or ended unexpectedly. Status: ${run.status}`, run.last_error);
-            const errorMessage = run.last_error ? `${run.last_error.code}: ${run.last_error.message}` : 'Unknown error';
-            throw new Error(`Assistant run failed. Status: ${run.status}. Error: ${errorMessage}`);
-        }
+                 console.error(`[Thread ${thread.id}] Run requires action, but tool call data is missing or empty.`, run);
+                 throw new Error("Function call was expected but not provided correctly by the Assistant.");
+             }
+             const toolCall = toolCalls[0];
+             if (toolCall.function.name !== functionSchema.name) {
+                  console.error(`[Thread ${thread.id}] Assistant called the wrong function. Expected: ${functionSchema.name}, Got: ${toolCall.function.name}`);
+                  throw new Error(`Assistant called the wrong function: ${toolCall.function.name}`);
+             }
+             const rawArgs = toolCall.function.arguments;
+             console.log(`[Thread ${thread.id}] Function call arguments received for ${toolCall.function.name}. Raw (truncated): ${rawArgs.substring(0,200)}...`);
+             try {
+                 const summaryObj = JSON.parse(rawArgs);
+                 console.log(`[Thread ${thread.id}] Successfully parsed function arguments.`);
+                 return summaryObj;
+             } catch (parseError) {
+                 console.error(`[Thread ${thread.id}] Failed to parse function call arguments JSON:`, parseError);
+                 console.error(`[Thread ${thread.id}] Raw arguments received:`, rawArgs);
+                 throw new Error(`Failed to parse function call arguments from AI: ${parseError.message}`);
+             }
+         } else if (run.status === 'completed') {
+              console.warn(`[Thread ${thread.id}] Run completed without requiring function call action, despite tool_choice forcing ${functionSchema.name}.`);
+              const messages = await openaiClient.beta.threads.messages.list(run.thread_id, { limit: 1 });
+              const lastMessageContent = messages.data[0]?.content[0]?.text?.value || "No text content found.";
+              console.warn(`[Thread ${thread.id}] Last message content from Assistant: ${lastMessageContent}`);
+              throw new Error(`Assistant run completed without making the required function call to ${functionSchema.name}.`);
+         } else {
+             console.error(`[Thread ${thread.id}] Run failed or ended unexpectedly. Status: ${run.status}`, run.last_error);
+             const errorMessage = run.last_error ? `${run.last_error.code}: ${run.last_error.message}` : 'Unknown error';
+             throw new Error(`Assistant run failed. Status: ${run.status}. Error: ${errorMessage}`);
+         }
 
     } catch (error) {
-        // Catch errors from thread creation, message sending, run execution, etc.
         console.error(`[Thread ${thread?.id || 'N/A'}] Error in generateSummary: ${error.message}`);
-        throw error; // Re-throw the error to be caught by the calling function (processSummary)
+        throw error;
     } finally {
         // Step 6: Cleanup - Ensure temporary files and OpenAI files are deleted
-        if (filePath) { // If a temporary local file was created
+        // *** Ensure correct filePath (which might be .txt now) is deleted ***
+        if (filePath) {
             try {
                 await fs.unlink(filePath);
                 console.log(`[Thread ${thread?.id || 'N/A'}] Deleted temporary file: ${filePath}`);
             } catch (unlinkError) {
-                // Log error but don't necessarily fail the entire process
                 console.error(`[Thread ${thread?.id || 'N/A'}] Error deleting temporary file ${filePath}:`, unlinkError);
             }
         }
@@ -750,8 +776,6 @@ async function generateSummary(
                 await openaiClient.files.del(fileId);
                 console.log(`[Thread ${thread?.id || 'N/A'}] Deleted OpenAI file: ${fileId}`);
             } catch (deleteError) {
-                // Log error but continue; failing to delete shouldn't stop the summary process
-                 // Check if the error is ignorable (e.g., file already deleted)
                  if (!(deleteError instanceof NotFoundError || deleteError?.status === 404)) {
                     console.error(`[Thread ${thread?.id || 'N/A'}] Error deleting OpenAI file ${fileId}:`, deleteError.message || deleteError);
                  } else {
@@ -759,10 +783,171 @@ async function generateSummary(
                  }
             }
         }
-        // Optional: Delete thread? Usually not needed unless specifically managing resources.
-        // if (thread) { try { await openaiClient.beta.threads.del(thread.id); console.log(`[Thread ${thread.id}] Deleted thread.`); } catch (e) { /* log */ } }
     }
 }
+
+// // --- OpenAI Summary Generation Function ---
+// async function generateSummary(
+//     activities, // Array of raw activities OR null (if data is already embedded in prompt)
+//     openaiClient,
+//     assistantId, // Accepts the ID dynamically
+//     userPrompt,
+//     functionSchema // The specific function schema object for this call
+// ) {
+//     let fileId = null;
+//     let thread = null;
+//     let filePath = null; // For temporary file path
+//     let inputMethod = "prompt"; // Default input method
+
+//     try {
+//         // Step 1: Create an OpenAI Thread
+//         thread = await openaiClient.beta.threads.create();
+//         console.log(`[Thread ${thread.id}] Created for Assistant ${assistantId}`);
+
+//         let finalUserPrompt = userPrompt; // Base prompt
+//         let messageAttachments = []; // Attachments for the message (e.g., file IDs)
+
+//         // Step 2: Determine Input Method based on activities array
+//         if (activities && Array.isArray(activities) && activities.length > 0) {
+//             if (activities.length < DIRECT_INPUT_THRESHOLD) {
+//                 // --- Method: Direct JSON Input ---
+//                 inputMethod = "direct JSON";
+//                 console.log(`[Thread ${thread.id}] Using direct JSON input (${activities.length} activities < ${DIRECT_INPUT_THRESHOLD}).`);
+//                 const activitiesJsonString = JSON.stringify(activities, null, 2); // Pretty print for AI readability
+//                 // Append the JSON data directly to the prompt content
+//                 finalUserPrompt += `\n\nHere is the activity data to process:\n\`\`\`json\n${activitiesJsonString}\n\`\`\``;
+//             } else {
+//                 // --- Method: File Upload Input ---
+//                 inputMethod = "file upload";
+//                 console.log(`[Thread ${thread.id}] Using file upload (${activities.length} activities >= ${DIRECT_INPUT_THRESHOLD}).`);
+//                 // Create a temporary local file
+//                 const timestamp = new Date().toISOString().replace(/[:.-]/g, "_");
+//                 const filename = `salesforce_activities_${timestamp}_${thread.id}.json`;
+//                 //filePath = path.join(TEMP_FILE_DIR); // Store in the temp directory
+//                 filePath = path.join(__dirname, filename);
+//                 await fs.ensureDir(path.dirname(filePath)); // Ensure the temp directory exists
+//                 await fs.writeJson(filePath, activities); // Write activities array as JSON
+//                 console.log(`[Thread ${thread.id}] Temporary file generated: ${filePath}`);
+
+//                 // Upload the file to OpenAI
+//                 const uploadResponse = await openaiClient.files.create({
+//                     file: fs.createReadStream(filePath),
+//                     purpose: "assistants", // Use 'assistants' purpose
+//                 });
+//                 fileId = uploadResponse.id;
+//                 console.log(`[Thread ${thread.id}] File uploaded to OpenAI: ${fileId}`);
+
+//                 // Prepare attachment for the message, linking the file and specifying the tool
+//                 messageAttachments.push({ file_id: fileId, tools: [{ type: "file_search" }] });
+//             }
+//         } else {
+//              // Case where activities is null or empty (e.g., quarterly call)
+//              console.log(`[Thread ${thread.id}] No activities array provided or array is empty. Using prompt content as is.`);
+//         }
+
+//         // Step 3: Add the User Message to the Thread
+//         const messagePayload = {
+//             role: "user",
+//             content: finalUserPrompt, // Use the potentially modified prompt
+//         };
+//         if (messageAttachments.length > 0) {
+//             messagePayload.attachments = messageAttachments;
+//         }
+
+//         const message = await openaiClient.beta.threads.messages.create(thread.id, messagePayload);
+//         console.log(`[Thread ${thread.id}] Message added (using ${inputMethod}). ID: ${message.id}`);
+
+//         // Step 4: Run the Assistant - CRITICAL: Force the specific function via tool_choice
+//         console.log(`[Thread ${thread.id}] Starting run, forcing function: ${functionSchema.name}`);
+//         const run = await openaiClient.beta.threads.runs.createAndPoll(thread.id, {
+//             assistant_id: assistantId,
+//             // IMPORTANT: Pass ONLY the required function schema in tools for this specific run
+//             tools: [{ type: "function", function: functionSchema }],
+//             // Explicitly tell the Assistant it MUST call this specific function
+//             tool_choice: { type: "function", function: { name: functionSchema.name } },
+//             // temperature: 0 // Optional: Set temperature to 0 for more deterministic output format
+//         });
+//         console.log(`[Thread ${thread.id}] Run status: ${run.status}`);
+
+//         // Step 5: Process the Run Outcome
+//         if (run.status === 'requires_action') {
+//             // Check if the required action involves the expected tool call
+//             const toolCalls = run.required_action?.submit_tool_outputs?.tool_calls;
+//             if (!toolCalls || toolCalls.length === 0) {
+//                 console.error(`[Thread ${thread.id}] Run requires action, but tool call data is missing or empty.`, run);
+//                 throw new Error("Function call was expected but not provided correctly by the Assistant.");
+//             }
+
+//             // Assuming only one tool call is expected per run in this setup
+//             const toolCall = toolCalls[0];
+
+//             // Verify the correct function was called (important sanity check)
+//             if (toolCall.function.name !== functionSchema.name) {
+//                  console.error(`[Thread ${thread.id}] Assistant called the wrong function. Expected: ${functionSchema.name}, Got: ${toolCall.function.name}`);
+//                  throw new Error(`Assistant called the wrong function: ${toolCall.function.name}`);
+//             }
+
+//             const rawArgs = toolCall.function.arguments;
+//             console.log(`[Thread ${thread.id}] Function call arguments received for ${toolCall.function.name}. Raw (truncated): ${rawArgs.substring(0,200)}...`);
+//             try {
+//                 // Parse the JSON arguments returned by the function call
+//                 const summaryObj = JSON.parse(rawArgs);
+//                 console.log(`[Thread ${thread.id}] Successfully parsed function arguments.`);
+//                 // We don't need to submit back tool outputs here, just return the parsed arguments
+//                 return summaryObj;
+//             } catch (parseError) {
+//                 console.error(`[Thread ${thread.id}] Failed to parse function call arguments JSON:`, parseError);
+//                 console.error(`[Thread ${thread.id}] Raw arguments received:`, rawArgs);
+//                 throw new Error(`Failed to parse function call arguments from AI: ${parseError.message}`);
+//             }
+//         } else if (run.status === 'completed') {
+//              // This is unexpected when tool_choice forces a function
+//              console.warn(`[Thread ${thread.id}] Run completed without requiring function call action, despite tool_choice forcing ${functionSchema.name}. Check Assistant instructions or prompt clarity.`);
+//              // Log the last message to understand what happened
+//              const messages = await openaiClient.beta.threads.messages.list(run.thread_id, { limit: 1 });
+//              const lastMessageContent = messages.data[0]?.content[0]?.text?.value || "No text content found.";
+//              console.warn(`[Thread ${thread.id}] Last message content from Assistant: ${lastMessageContent}`);
+//              throw new Error(`Assistant run completed without making the required function call to ${functionSchema.name}.`);
+//         } else {
+//             // Handle other terminal statuses: 'failed', 'cancelled', 'expired'
+//             console.error(`[Thread ${thread.id}] Run failed or ended unexpectedly. Status: ${run.status}`, run.last_error);
+//             const errorMessage = run.last_error ? `${run.last_error.code}: ${run.last_error.message}` : 'Unknown error';
+//             throw new Error(`Assistant run failed. Status: ${run.status}. Error: ${errorMessage}`);
+//         }
+
+//     } catch (error) {
+//         // Catch errors from thread creation, message sending, run execution, etc.
+//         console.error(`[Thread ${thread?.id || 'N/A'}] Error in generateSummary: ${error.message}`);
+//         throw error; // Re-throw the error to be caught by the calling function (processSummary)
+//     } finally {
+//         // Step 6: Cleanup - Ensure temporary files and OpenAI files are deleted
+//         if (filePath) { // If a temporary local file was created
+//             try {
+//                 await fs.unlink(filePath);
+//                 console.log(`[Thread ${thread?.id || 'N/A'}] Deleted temporary file: ${filePath}`);
+//             } catch (unlinkError) {
+//                 // Log error but don't necessarily fail the entire process
+//                 console.error(`[Thread ${thread?.id || 'N/A'}] Error deleting temporary file ${filePath}:`, unlinkError);
+//             }
+//         }
+//         if (fileId) { // If a file was uploaded to OpenAI
+//             try {
+//                 await openaiClient.files.del(fileId);
+//                 console.log(`[Thread ${thread?.id || 'N/A'}] Deleted OpenAI file: ${fileId}`);
+//             } catch (deleteError) {
+//                 // Log error but continue; failing to delete shouldn't stop the summary process
+//                  // Check if the error is ignorable (e.g., file already deleted)
+//                  if (!(deleteError instanceof NotFoundError || deleteError?.status === 404)) {
+//                     console.error(`[Thread ${thread?.id || 'N/A'}] Error deleting OpenAI file ${fileId}:`, deleteError.message || deleteError);
+//                  } else {
+//                      console.log(`[Thread ${thread?.id || 'N/A'}] OpenAI file ${fileId} already deleted or not found.`);
+//                  }
+//             }
+//         }
+//         // Optional: Delete thread? Usually not needed unless specifically managing resources.
+//         // if (thread) { try { await openaiClient.beta.threads.del(thread.id); console.log(`[Thread ${thread.id}] Deleted thread.`); } catch (e) { /* log */ } }
+//     }
+// }
 
 
 // --- Salesforce Record Creation/Update Function ---
