@@ -1069,6 +1069,7 @@ async function createTimileSummarySalesforceRecords(conn, summaries, parentId, s
 // --- Salesforce Data Fetching with Pagination ---
 async function fetchRecords(conn, queryOrUrl, allRecords = [], isFirstIteration = true) {
     try {
+        console.log(`QUERY : ${queryOrUrl}. `);
         //const logPrefix = isFirstIteration ? "Initial query" : "Querying more records from";
         // Avoid logging potentially sensitive parts of the URL/query
         //console.log(`${logPrefix}: ${typeof queryOrUrl === 'string' && queryOrUrl.startsWith('SELECT') ? queryOrUrl.substring(0, 150) + '...' : 'nextRecordsUrl'}`);
@@ -1079,7 +1080,7 @@ async function fetchRecords(conn, queryOrUrl, allRecords = [], isFirstIteration 
             : await conn.queryMore(queryOrUrl); // queryOrUrl here is nextRecordsUrl
 
         const fetchedCount = queryResult.records ? queryResult.records.length : 0;
-        //console.log(`Fetched ${fetchedCount} records. Total so far: ${allRecords.length + fetchedCount}. Done: ${queryResult.done}`);
+        console.log(`Fetched 1000 more records. Done: ${queryResult.done}`);
 
         // if (fetchedCount > 0) {
         //     allRecords = allRecords.concat(queryResult.records);
