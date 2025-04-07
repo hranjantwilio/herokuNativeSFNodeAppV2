@@ -1070,9 +1070,9 @@ async function createTimileSummarySalesforceRecords(conn, summaries, parentId, s
 async function fetchRecords(conn, queryOrUrl, allRecords = [], isFirstIteration = true) {
     try {
         console.log(`QUERY : ${queryOrUrl}. `);
-        //const logPrefix = isFirstIteration ? "Initial query" : "Querying more records from";
+        const logPrefix = isFirstIteration ? "Initial query" : "Querying more records from";
         // Avoid logging potentially sensitive parts of the URL/query
-        //console.log(`${logPrefix}: ${typeof queryOrUrl === 'string' && queryOrUrl.startsWith('SELECT') ? queryOrUrl.substring(0, 150) + '...' : 'nextRecordsUrl'}`);
+        console.log(`${logPrefix}: ${typeof queryOrUrl === 'string' && queryOrUrl.startsWith('SELECT') ? queryOrUrl.substring(0, 150) + '...' : 'nextRecordsUrl'}`);
 
         // Use query() for initial SOQL, queryMore() for subsequent nextRecordsUrl
         const queryResult = isFirstIteration
@@ -1082,9 +1082,9 @@ async function fetchRecords(conn, queryOrUrl, allRecords = [], isFirstIteration 
         const fetchedCount = queryResult.records ? queryResult.records.length : 0;
         console.log(`Fetched 1000 more records. Done: ${queryResult.done}`);
 
-        // if (fetchedCount > 0) {
-        //     allRecords = allRecords.concat(queryResult.records);
-        // }
+        if (fetchedCount > 0) {
+            allRecords = allRecords.concat(queryResult.records);
+        }
 
         // Check if more records exist and a URL is provided
         if (!queryResult.done && queryResult.nextRecordsUrl) {
