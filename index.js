@@ -1,41 +1,27 @@
 /*
- * =============================================================================
- *   FULL USABLE CODE - Salesforce Activity Summarizer (Bulk Query Polling)
- * =============================================================================
- *
- * Enhanced Node.js Express application for generating Salesforce activity summaries
- * using OpenAI Assistants. Optimized for memory usage on platforms like Heroku
- * using Salesforce Bulk Query API Job Polling.
+ * Enhanced Node.js Express application for generating Salesforce activity summaries using OpenAI Assistants.
  *
  * Features:
- * - Salesforce Bulk Query API job polling to handle large datasets without
- *   loading all records into memory at once. Fetches results in batches.
- * - Per-task OpenAI Assistant creation/deletion for isolation.
- * - Asynchronous processing with immediate acknowledgement (202 Accepted).
- * - Salesforce integration (bulk query fetch, bulk save).
- * - OpenAI Assistants API V2 usage with Function Calling.
+ * - Creates/Retrieves OpenAI Assistants on startup and stores IDs.
+ * - Asynchronous processing with immediate acknowledgement.
+ * - Salesforce integration (fetching activities, saving summaries).
+ * - OpenAI Assistants API V2 usage.
  * - Dynamic function schema loading (default or from request).
  * - Dynamic tool_choice to force specific function calls (monthly/quarterly).
- * - Conditional input method for AI: Direct JSON or File Upload.
- * - Incremental processing: Generates & saves monthly summaries from result
- *   batches, then aggregates & saves quarterly summaries.
+ * - Conditional input method: Direct JSON in prompt (< threshold) or File Upload (>= threshold).
+ * - Generates summaries per month and aggregates per relevant quarter individually.
  * - Robust error handling and callback mechanism.
- * - Temporary file management for AI file uploads.
- * - Data truncation options for large fields.
- * - Sub-batching within monthly processing for finer memory control.
+ * - Temporary file management.
  */
 
 // --- Dependencies ---
 const express = require('express');
 const jsforce = require('jsforce');
 const dotenv = require('dotenv');
-const { OpenAI, NotFoundError } = require("openai");
-const fs = require("fs-extra");
+const { OpenAI, NotFoundError } = require("openai"); // Import NotFoundError specifically
+const fs = require("fs-extra"); // Using fs-extra for promise-based file operations and JSON handling
 const path = require("path");
 const axios = require("axios");
-// Note: stream and stream/promises are built-in, no separate install needed
-const { Readable } = require('stream');
-const { pipeline } = require('stream/promises');
 
 // --- Load Environment Variables ---
 dotenv.config();
@@ -46,29 +32,24 @@ const PORT = process.env.PORT || 3000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o";
-const TIMELINE_SUMMARY_OBJECT_API_NAME = "Timeline_Summary__c"; // Your Salesforce object API name
-const DIRECT_INPUT_THRESHOLD = 1500; // Max activities for direct JSON input to AI
-const PROMPT_LENGTH_THRESHOLD = 200000; // Max chars for AI prompt before switching to file upload
+const TIMELINE_SUMMARY_OBJECT_API_NAME = "Timeline_Summary__c"; // Salesforce object API name
+const DIRECT_INPUT_THRESHOLD = 2000; // Max activities for direct JSON input in prompt
 const TEMP_FILE_DIR = path.join(__dirname, 'temp_files'); // Directory for temporary files
-const BULK_QUERY_BATCH_SIZE = 500; // Process records in sub-batches within a month's results
-const DESCRIPTION_TRUNCATE_LENGTH = 1000; // Max chars for Description field passed to AI
-const SUBJECT_TRUNCATE_LENGTH = 250;    // Max chars for Subject field passed to AI
-const BULK_API_POLL_TIMEOUT = 300000; // 5 minutes timeout for Bulk API job polling
-const BULK_API_POLL_INTERVAL = 15000; // 15 seconds interval for Bulk API job polling
-
 
 // --- Environment Variable Validation ---
 if (!SF_LOGIN_URL || !OPENAI_API_KEY) {
     console.error("FATAL ERROR: Missing required environment variables (SF_LOGIN_URL, OPENAI_API_KEY).");
-    process.exit(1);
+    process.exit(1); // Exit if essential config is missing
 }
 
+
+
 // --- Default OpenAI Function Schemas ---
-// (Ensure parameter descriptions match truncated fields if applicable)
+// These can be overridden by 'monthJSON' and 'qtrJSON' in the request body.
 const defaultFunctions = [
     {
       "name": "generate_monthly_activity_summary",
-      "description": "Generates a structured monthly sales activity summary with insights and categorization based on provided activity data (fields like Description/Subject may be truncated). Apply sub-theme segmentation within activityMapping.",
+      "description": "Generates a structured monthly sales activity summary with insights and categorization based on provided activity data. Apply sub-theme segmentation within activityMapping.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -98,7 +79,7 @@ const defaultFunctions = [
                         "type": "object",
                         "properties": {
                           "Id": { "type": "string", "description": "Salesforce Id of the specific activity" },
-                          "LinkText": { "type": "string", "description": "'MMM DD YYYY: Short Description (max 50 chars)' - Generate from ActivityDate, Subject, Description (subject/desc may be truncated)." },
+                          "LinkText": { "type": "string", "description": "'MMM DD YYYY: Short Description (max 50 chars)' - Generate from ActivityDate, Subject, Description." },
                           "ActivityDate": { "type": "string", "description": "Activity Date in 'YYYY-MM-DD' format. Must belong to the summarized month/year." }
                         },
                         "required": ["Id", "LinkText", "ActivityDate"],
@@ -125,7 +106,7 @@ const defaultFunctions = [
                           "type": "object",
                           "properties": {
                             "Id": { "type": "string", "description": "Salesforce Id of the specific activity" },
-                            "LinkText": { "type": "string", "description": "'MMM DD YYYY: Short Description (max 50 chars)' - Generate from ActivityDate, Subject, Description (subject/desc may be truncated)." },
+                            "LinkText": { "type": "string", "description": "'MMM DD YYYY: Short Description (max 50 chars)' - Generate from ActivityDate, Subject, Description." },
                             "ActivityDate": { "type": "string", "description": "Activity Date in 'YYYY-MM-DD' format. Must belong to the summarized month/year." }
                           },
                           "required": ["Id", "LinkText", "ActivityDate"],
@@ -151,7 +132,7 @@ const defaultFunctions = [
                           "type": "object",
                           "properties": {
                             "Id": { "type": "string", "description": "Salesforce Id of the specific activity" },
-                            "LinkText": { "type": "string", "description": "'MMM DD YYYY: Short Description (max 50 chars)' - Generate from ActivityDate, Subject, Description (subject/desc may be truncated)." },
+                            "LinkText": { "type": "string", "description": "'MMM DD YYYY: Short Description (max 50 chars)' - Generate from ActivityDate, Subject, Description." },
                             "ActivityDate": { "type": "string", "description": "Activity Date in 'YYYY-MM-DD' format. Must belong to the summarized month/year." }
                           },
                           "required": ["Id", "LinkText", "ActivityDate"],
@@ -167,7 +148,7 @@ const defaultFunctions = [
           },
           "activityCount": {
             "type": "integer",
-            "description": "Total number of activities processed for the month/batch (matching the input count)."
+            "description": "Total number of activities processed for the month (matching the input count)."
           }
         },
         "required": ["summary", "activityMapping", "activityCount"]
@@ -264,40 +245,47 @@ const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
 // --- Express Application Setup ---
 const app = express();
-// Adjust limits if needed, but 10mb should be sufficient for most requests/responses
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json({ limit: '10mb' })); // Increase JSON payload limit if needed for direct input
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
+
+// --- Helper to create an Assistant ---
+async function createAssistant(name, instructions, tools, model) {
+
+    // 2. Create a new assistant if no valid ID was provided or retrieval failed
+    console.log(`Creating new Assistant: ${name}`);
+    try {
+        const newAssistant = await openai.beta.assistants.create({
+            name: name,
+            instructions: instructions,
+            tools: tools,
+            model: model,
+        });
+        console.log(`Successfully created new Assistant ${name} with ID: ${newAssistant.id}`);
+        return newAssistant.id;
+    } catch (creationError) {
+         console.error(`Error creating Assistant ${name}:`, creationError);
+         throw creationError; // Propagate error
+    }
+}
+
+
 // --- Server Startup ---
-app.listen(PORT, async () => {
+app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
     console.log(`Using OpenAI Model: ${OPENAI_MODEL}`);
     console.log(`Direct JSON input threshold: ${DIRECT_INPUT_THRESHOLD} activities`);
-    console.log(`Prompt length threshold: ${PROMPT_LENGTH_THRESHOLD} characters`);
-    console.log(`Bulk Query Sub-Batch Size: ${BULK_QUERY_BATCH_SIZE}`);
-    console.log(`Description Truncation: ${DESCRIPTION_TRUNCATE_LENGTH} chars`);
-    console.log(`Subject Truncation: ${SUBJECT_TRUNCATE_LENGTH} chars`);
-    console.log(`Bulk API Poll Timeout: ${BULK_API_POLL_TIMEOUT}ms`);
-    console.log(`Bulk API Poll Interval: ${BULK_API_POLL_INTERVAL}ms`);
-    try {
-        // Ensure temp directory exists on startup
-        await fs.ensureDir(TEMP_FILE_DIR);
-        console.log(`Temporary file directory ensured at: ${TEMP_FILE_DIR}`);
-    } catch (err) {
-        console.error(`FATAL: Could not create temporary directory ${TEMP_FILE_DIR}. Exiting.`, err);
-        process.exit(1);
-    }
-});
+  });
+
 
 // --- Main API Endpoint ---
 app.post('/generatesummary', async (req, res) => {
-    const requestLogPrefix = "[Request]"; // Prefix for logs related to this specific request handling
-    console.log(`${requestLogPrefix} Received /generatesummary request`);
+    console.log("Received /generatesummary request");
 
     // --- Authorization ---
     const authHeader = req.headers["authorization"];
     if (!authHeader || !authHeader.startsWith("Bearer ")) {
-        console.warn(`${requestLogPrefix} Unauthorized request: Missing or invalid Bearer token.`);
+        console.warn("Unauthorized request: Missing or invalid Bearer token.");
         return res.status(401).json({ error: "Unauthorized" });
     }
     const accessToken = authHeader.split(" ")[1];
@@ -309,28 +297,16 @@ app.post('/generatesummary', async (req, res) => {
         userPrompt, // Template for monthly prompt
         userPromptQtr, // Template for quarterly prompt
         queryText, // SOQL query to fetch activities
-        summaryMap, // Optional JSON string map of existing summary records
+        summaryMap, // Optional JSON string map of existing summary records (e.g., {"Jan 2024": "recordId"})
         loggedinUserId,
-        qtrJSON, // Optional override for quarterly function schema
-        monthJSON // Optional override for monthly function schema
+        qtrJSON, // Optional override for quarterly function schema (JSON string)
+        monthJSON // Optional override for monthly function schema (JSON string)
     } = req.body;
 
     if (!accountId || !callbackUrl || !accessToken || !queryText || !userPrompt || !userPromptQtr || !loggedinUserId) {
-        console.warn(`${requestLogPrefix} Bad Request: Missing required parameters.`);
+        console.warn("Bad Request: Missing required parameters.");
         return res.status(400).send({ error: "Missing required parameters (accountId, callbackUrl, accessToken, queryText, userPrompt, userPromptQtr, loggedinUserId)" });
     }
-
-     // Validate SOQL basic structure and REQUIRED ordering
-     if (!queryText.toLowerCase().includes('select') || !queryText.toLowerCase().includes('from') || !queryText.toLowerCase().includes('activitydate')) {
-         console.warn(`${requestLogPrefix} Bad Request: queryText seems invalid or missing ActivityDate field.`);
-         return res.status(400).send({ error: "queryText must be a valid SOQL query including the ActivityDate field." });
-     }
-     // Crucial for bulk query result processing logic: Ensure ORDER BY ActivityDate ASC is present
-     if (!queryText.toLowerCase().includes('order by activitydate asc')) {
-         console.warn(`${requestLogPrefix} Bad Request: queryText MUST include 'ORDER BY ActivityDate ASC' for processing logic to work correctly.`);
-         return res.status(400).send({ error: "queryText must include 'ORDER BY ActivityDate ASC'." });
-     }
-
 
     // --- Parse Optional JSON Inputs Safely ---
     let summaryRecordsMap = {};
@@ -346,52 +322,50 @@ app.post('/generatesummary', async (req, res) => {
             if (!monthlyFuncSchema || monthlyFuncSchema.name !== 'generate_monthly_activity_summary') {
                 throw new Error("Provided monthJSON schema is invalid or missing the correct name property.");
             }
-            console.log(`${requestLogPrefix} Using custom monthly function schema from request.`);
+            console.log("Using custom monthly function schema from request.");
         }
          if (qtrJSON) {
             quarterlyFuncSchema = JSON.parse(qtrJSON);
             if (!quarterlyFuncSchema || quarterlyFuncSchema.name !== 'generate_quarterly_activity_summary') {
                  throw new Error("Provided qtrJSON schema is invalid or missing the correct name property.");
             }
-            console.log(`${requestLogPrefix} Using custom quarterly function schema from request.`);
+            console.log("Using custom quarterly function schema from request.");
         }
     } catch (e) {
-        console.error(`${requestLogPrefix} Failed to parse JSON input from request body:`, e);
+        console.error("Failed to parse JSON input from request body:", e);
         return res.status(400).send({ error: `Invalid JSON provided in summaryMap, monthJSON, or qtrJSON. ${e.message}` });
     }
 
-    // --- Ensure Schemas are Available ---
-    if (!monthlyFuncSchema || !quarterlyFuncSchema) {
-        console.error(`${requestLogPrefix} FATAL: Default function schemas could not be loaded or found.`);
-        return res.status(500).send({ error: "Internal server error: Could not load function schemas."});
-    }
+     // --- Ensure Schemas are Available ---
+     if (!monthlyFuncSchema || !quarterlyFuncSchema) {
+         console.error("FATAL: Default function schemas could not be loaded or found.");
+         return res.status(500).send({ error: "Internal server error: Could not load function schemas."});
+     }
 
     // --- Acknowledge Request (202 Accepted) ---
-    // Send response immediately, process runs in background
-    res.status(202).json({ status: 'processing', message: 'Summary generation initiated using Bulk API. You will receive a callback.' });
-    console.log(`${requestLogPrefix} Initiating summary processing for Account ID: ${accountId}`);
+    res.status(202).json({ status: 'processing', message: 'Summary generation initiated. You will receive a callback.' });
+    console.log(`Initiating summary processing for Account ID: ${accountId}`);
 
     // --- Start Asynchronous Processing ---
-    // Run processSummary without awaiting it here. Handle errors within the function via callback.
-    processSummary( // Call the Bulk Query Job Polling version
+    // Run processSummary without awaiting it here. Handle errors within the function or via catch block.
+    processSummary(
         accountId,
         accessToken,
         callbackUrl,
         userPrompt,
         userPromptQtr,
-        queryText, // Pass the validated SOQL query
+        queryText,
         summaryRecordsMap,
         loggedinUserId,
         monthlyFuncSchema,
         quarterlyFuncSchema
     ).catch(async (error) => {
-        // This catch block handles errors thrown BEFORE the main try/catch inside processSummary
-        console.error(`${requestLogPrefix} Unhandled error during background processing setup for ${accountId}:`, error.stack);
+        // Catch unhandled errors from the top level of processSummary
+        console.error(`[${accountId}] Unhandled error during background processing:`, error);
         try {
-            // Attempt to send a failure callback if setup fails badly
-            await sendCallbackResponse(accountId, callbackUrl, loggedinUserId, accessToken, "Failed", `Unhandled processing setup error: ${error.message}`);
+            await sendCallbackResponse(accountId, callbackUrl, loggedinUserId, accessToken, "Failed", `Unhandled processing error: ${error.message}`);
         } catch (callbackError) {
-            console.error(`${requestLogPrefix} Failed to send error callback after unhandled setup exception for ${accountId}:`, callbackError);
+            console.error(`[${accountId}] Failed to send error callback after unhandled exception:`, callbackError);
         }
     });
 });
@@ -406,772 +380,887 @@ function getQuarterFromMonthIndex(monthIndex) {
     return 'Unknown'; // Should not happen with valid index
 }
 
-
-// --- Asynchronous Summary Processing Logic (Refactored for Bulk Query Job Polling) ---
+// --- Asynchronous Summary Processing Logic ---
 async function processSummary(
     accountId,
     accessToken,
     callbackUrl,
     userPromptMonthlyTemplate,
     userPromptQuarterlyTemplate,
-    queryText, // SOQL query (MUST include ORDER BY ActivityDate ASC)
+    queryText,
     summaryRecordsMap,
     loggedinUserId,
     monthlyFuncSchema,
     quarterlyFuncSchema
 ) {
-    const logPrefix = `[Process ${accountId}]`;
-    console.log(`${logPrefix} Starting processSummary (Bulk Query Job Polling)...`);
+    console.log(`[${accountId}] Starting processSummary...`);
+    // Use the globally initialized Assistant IDs
+
+
     const conn = new jsforce.Connection({
         instanceUrl: SF_LOGIN_URL,
         accessToken: accessToken,
-        maxRequest: 10, // Retry requests on transient errors
-        // Use configured poll settings
-        pollTimeout: BULK_API_POLL_TIMEOUT,
-        pollInterval: BULK_API_POLL_INTERVAL,
+        // Consider adding maxRequest setting or handling token expiry for long processes
+        // maxRequest: 10, // Example: retry requests up to 10 times
     });
 
-    // Stores AI output from monthly summaries for quarterly aggregation
-    const quarterlyInputs = {};
-    const monthMap = { january: 0, february: 1, march: 2, april: 3, may: 4, june: 5, july: 6, august: 7, september: 8, october: 9, november: 10, december: 11 };
-    let overallStatus = "Success"; // Assume success until an error occurs
-    let failureMessages = [];
-    let recordCount = 0; // Count records processed from results
-    let currentYear = null;
-    let currentMonth = null;
-    let currentMonthActivities = []; // Holds activities for the current month/sub-batch being processed
-    let bulkJob = null; // Reference to the bulk job for potential cleanup
-
-    // --- Helper Function to process a completed month's batch ---
-    // This function takes a batch of activities for a single month and processes it
-    async function processAndSaveMonthBatch(year, month, activities) {
-        const activityCount = activities.length;
-        if (activityCount === 0) return; // Safety check
-
-        const batchLogPrefix = `${logPrefix} -> [Batch ${month} ${year}]`;
-        console.log(`${batchLogPrefix} Processing ${activityCount} activities`);
-        const monthIndex = monthMap[month.toLowerCase()];
-        if (monthIndex === undefined) {
-            console.warn(`${batchLogPrefix} Could not map month name: ${month}. Skipping batch.`);
-            return;
-        }
-        const startDate = new Date(Date.UTC(year, monthIndex, 1));
-        const startDateStr = startDate.toISOString().split('T')[0];
-        const userPromptMonthly = userPromptMonthlyTemplate.replace('{{YearMonth}}', `${month} ${year}`);
-
-        let monthlyAiOutput = null;
-        let monthlyAssistant = null;
-
-        try {
-            // Create a unique name for the assistant for better tracking if needed
-            const assistantName = `Monthly Summarizer ${accountId} ${year}-${month}-${Date.now()}`;
-            console.log(`${batchLogPrefix}   Creating Assistant: ${assistantName}`);
-            monthlyAssistant = await openai.beta.assistants.create({
-               name: assistantName,
-               instructions: "You are an AI assistant specialized in analyzing raw Salesforce activity data for a single month (fields like Description/Subject may be truncated) and generating structured JSON summaries using the provided function 'generate_monthly_activity_summary'. Apply sub-theme segmentation. Focus on key themes, tone, and actions.",
-               tools: [{ type: "file_search" }, { type: "function", "function": monthlyFuncSchema }],
-               model: OPENAI_MODEL, // Use configured model
-            });
-            console.log(`${batchLogPrefix}   Created Assistant ID: ${monthlyAssistant.id}`);
-
-            // Generate the summary using the AI
-            monthlyAiOutput = await generateSummary(activities, openai, monthlyAssistant.id, userPromptMonthly, monthlyFuncSchema, accountId);
-            console.log(`${batchLogPrefix}   Generated monthly summary AI output.`);
-
-            // Prepare the data structure for saving to Salesforce
-            const monthlyForSalesforce = {
-               [year]: {
-                   [month]: {
-                       summary: JSON.stringify(monthlyAiOutput), // Store the full AI JSON response
-                       summaryDetails: monthlyAiOutput?.summary || '', // Extract the HTML summary part
-                       count: activityCount, // Number of activities in this specific batch
-                       startdate: startDateStr
-                   }
-               }
-            };
-
-            // Save the generated summary to Salesforce
-            console.log(`${batchLogPrefix}   Saving monthly summary to Salesforce...`);
-            await createTimileSummarySalesforceRecords(conn, monthlyForSalesforce, accountId, 'Monthly', summaryRecordsMap);
-            console.log(`${batchLogPrefix}   Saved monthly summary.`);
-
-            // Store the AI output needed for the quarterly aggregation step
-            const quarter = getQuarterFromMonthIndex(monthIndex);
-            const quarterKey = `${year}-${quarter}`;
-            if (!quarterlyInputs[quarterKey]) {
-                quarterlyInputs[quarterKey] = { monthSummaries: [], year: parseInt(year), quarter: quarter };
-            }
-            quarterlyInputs[quarterKey].monthSummaries.push(monthlyAiOutput);
-
-        } catch (monthError) {
-            // Log errors encountered during this batch processing
-            console.error(`${batchLogPrefix} Error processing batch:`, monthError.stack);
-            overallStatus = "Failed"; // Mark the entire process as failed if any batch errors out
-            failureMessages.push(`Failed processing ${month} ${year}: ${monthError.message}`);
-        } finally {
-            // Ensure the temporary OpenAI assistant is deleted
-            if (monthlyAssistant?.id) {
-                try {
-                    console.log(`${batchLogPrefix}   Deleting monthly assistant ${monthlyAssistant.id}`);
-                    await openai.beta.assistants.del(monthlyAssistant.id);
-                    console.log(`${batchLogPrefix}   Deleted monthly assistant ${monthlyAssistant.id}`);
-                } catch (delError) {
-                    console.warn(`${batchLogPrefix}   Could not delete monthly assistant ${monthlyAssistant.id}:`, delError.message || delError);
-                 }
-            }
-            // Help garbage collector by nullifying references
-            activities = null;
-            monthlyAiOutput = null;
-        }
-    }
-    // --- End of processAndSaveMonthBatch ---
-
-    // --- Main Processing Logic ---
     try {
-        // 1. Execute Bulk Query Job and Process Results via Polling
-        console.log(`${logPrefix} Starting Bulk API Query job... Query: ${queryText.substring(0,150)}...`);
+        // 1. Fetch Salesforce Records
+        console.log(`[${accountId}] Fetching Salesforce records...`);
+        const groupedData = await fetchRecords(conn, queryText);
+        console.log(`[${accountId}] Fetched and grouped data by year/month.`);
 
-        // Create the Bulk API job for the 'query' operation.
-        // Use a relevant object name; it's mainly for context, the query defines the actual object.
-        // Using 'Account' as a placeholder, adjust if needed, though it matters less for 'query'.
-        bulkJob = conn.bulk.createJob("Account", "query"); // Changed object to Account for example
+        // 2. Generate Monthly Summaries
+        const finalMonthlySummaries = {}; // Structure: { year: { month: { aiOutput: {}, count: N, startdate: "...", year: Y, monthIndex: M } } }
+        const monthMap = { january: 0, february: 1, march: 2, april: 3, may: 4, june: 5, july: 6, august: 7, september: 8, october: 9, november: 10, december: 11 };
 
-        // Create a batch within the job containing the SOQL query
-        const batch = bulkJob.createBatch();
-
-        // Listen for the 'queue' event to know the batch is submitted
-        // Use a Promise to wait for the entire batch processing (polling + result fetching)
-        await new Promise((resolve, reject) => {
-            batch.on("queue", (batchInfo) => {
-                console.log(`${logPrefix} Bulk query batch queued. Batch ID: ${batchInfo.id}, Job ID: ${batchInfo.jobId}`);
-
-                // Start polling for the batch completion status using the configured interval and timeout
-                console.log(`${logPrefix} Starting to poll batch status (Interval: ${conn.pollInterval}ms, Timeout: ${conn.pollTimeout}ms)...`);
-                batch.poll(conn.pollInterval, conn.pollTimeout); // jsforce handles the polling loop
-
-                // Listen for the 'response' event, which fires when polling detects completion
-                batch.on("response", async (results) => {
-                    console.log(`${logPrefix} Bulk query job finished. Received ${results.length} result locators (batches). Processing results...`);
-                    recordCount = 0; // Reset count for records fetched from results
-
-                    try {
-                        // Iterate through each result locator returned by the completed job
-                        for (const resultInfo of results) {
-                            const resultBatchLogPrefix = `${logPrefix} -> [Result Batch ${resultInfo.id}]`;
-                            console.log(`${resultBatchLogPrefix} Fetching results...`);
-                            // Retrieve the actual records associated with this result batch ID
-                            // This fetches one chunk of the total query result from SF storage
-                            const records = await conn.bulk.job(resultInfo.jobId).batch(resultInfo.id).result();
-                            console.log(`${resultBatchLogPrefix} Fetched ${records.length} records.`);
-
-                            // --- Process the fetched records from this result batch ---
-                            for (const record of records) {
-                                recordCount++;
-                                // Basic validation
-                                if (!record.ActivityDate) {
-                                    console.warn(`[Result Record ${recordCount} ${accountId}] Skipping activity (ID: ${record.Id || 'Unknown'}) - missing ActivityDate.`);
-                                    continue;
-                                }
-                                try {
-                                    const date = new Date(record.ActivityDate);
-                                    if (isNaN(date.getTime())) {
-                                         console.warn(`[Result Record ${recordCount} ${accountId}] Skipping activity (ID: ${record.Id || 'Unknown'}) - invalid ActivityDate: ${record.ActivityDate}`);
-                                         continue;
-                                     }
-
-                                    const year = date.getUTCFullYear();
-                                    const month = date.toLocaleString('en-US', { month: 'long', timeZone: 'UTC' });
-
-                                    // --- Month Change Detection (Requires ORDER BY ActivityDate ASC) ---
-                                    // Check if the current record belongs to a new month/year compared to the previous one
-                                    if (year !== currentYear || month !== currentMonth) {
-                                        // If we have accumulated activities from the *previous* month, process them now.
-                                        if (currentMonthActivities.length > 0) {
-                                            await processAndSaveMonthBatch(currentYear, currentMonth, currentMonthActivities);
-                                            currentMonthActivities = []; // Clear the batch after processing
-                                        }
-                                        // Update the state to the new month/year
-                                        currentYear = year;
-                                        currentMonth = month;
-                                    }
-
-                                    // Add essential, TRUNCATED data to the current month's activity batch
-                                    currentMonthActivities.push({
-                                        Id: record.Id,
-                                        Description: record.Description?.substring(0, DESCRIPTION_TRUNCATE_LENGTH) || null,
-                                        Subject: record.Subject?.substring(0, SUBJECT_TRUNCATE_LENGTH) || null,
-                                        ActivityDate: record.ActivityDate // Store the original date string
-                                        // Add other essential fields if needed by AI
-                                    });
-
-                                    // --- Sub-Batching within a Month's Results ---
-                                    // If the accumulated activities for the current month reach the sub-batch size,
-                                    // process them immediately to keep memory usage low even within large result batches.
-                                    if (currentMonthActivities.length >= BULK_QUERY_BATCH_SIZE) {
-                                         console.log(`[Result ${accountId}] Processing sub-batch for ${currentMonth} ${currentYear} (size ${currentMonthActivities.length})`);
-                                         await processAndSaveMonthBatch(currentYear, currentMonth, currentMonthActivities);
-                                         currentMonthActivities = []; // Clear the processed sub-batch
-                                    }
-
-                                } catch (recordError) {
-                                    // Log errors processing individual records but continue with the next record
-                                    console.error(`[Result Record ${recordCount} ${accountId}] Error processing record (ID: ${record.Id || 'Unknown'}):`, recordError.stack);
-                                    // Optionally mark status as partial success here
-                                }
-                            } // --- End of record processing loop for this result batch ---
-                        } // --- End of loop iterating through result locators ---
-
-                        // Process the very last accumulated batch after all result sets have been handled
-                        if (currentMonthActivities.length > 0) {
-                            console.log(`${logPrefix} Processing final accumulated batch for ${currentMonth} ${currentYear} (${currentMonthActivities.length} records)`);
-                            await processAndSaveMonthBatch(currentYear, currentMonth, currentMonthActivities);
-                            currentMonthActivities = []; // Clear the final batch
-                        }
-                        console.log(`${logPrefix} Finished processing all bulk query results. Total records processed: ${recordCount}.`);
-                        resolve(); // Resolve the main promise indicating successful processing of results
-
-                    } catch (fetchError) {
-                         // Catch errors during the result fetching loop
-                         console.error(`${logPrefix} Error fetching or processing bulk results:`, fetchError.stack);
-                         failureMessages.push(`Failed to fetch/process results: ${fetchError.message}`);
-                         reject(fetchError); // Reject the main promise
+        for (const year in groupedData) {
+            console.log(`[${accountId}] Processing Year: ${year} for Monthly Summaries`);
+            finalMonthlySummaries[year] = {};
+            for (const monthObj of groupedData[year]) {
+                for (const month in monthObj) {
+                    const activities = monthObj[month];
+                    console.log(`[${accountId}]   Processing Month: ${month} (${activities.length} activities)`);
+                    if (activities.length === 0) {
+                        console.log(`[${accountId}]   Skipping empty month: ${month} ${year}.`);
+                        continue;
                     }
-                }); // End of "response" handler
 
-                // Listen for errors during the polling process itself
-                batch.on("error", (err) => {
-                    console.error(`${logPrefix} Error during bulk query batch polling/processing:`, err);
-                    failureMessages.push(`Bulk query batch error: ${err.message}`);
-                    reject(err); // Reject the main promise on batch error
-                });
+                    const monthIndex = monthMap[month.toLowerCase()];
+                    if (monthIndex === undefined) {
+                         console.warn(`[${accountId}]   Could not map month name: ${month}. Skipping.`);
+                        continue;
+                    }
+                    // Use UTC to avoid timezone shifts when creating the start date
+                    const startDate = new Date(Date.UTC(year, monthIndex, 1));
+                    // Replace placeholder in the user prompt template
+                    const userPromptMonthly = userPromptMonthlyTemplate.replace('{{YearMonth}}', `${month} ${year}`);
+                    const monthlyAssistant = await openai.beta.assistants.create({
+                        name: "Salesforce Monthly Summarizer",
+                        instructions: "You are an AI assistant specialized in analyzing raw Salesforce activity data for a single month and generating structured JSON summaries using the provided function 'generate_monthly_activity_summary'. Apply sub-theme segmentation within the activityMapping as described in the function schema. Focus on extracting key themes, tone, and recommended actions.",
+                        tools: [{ type: "file_search" },{type:"function" , "function" : monthlyFuncSchema}], // Allows using files
+                        model: "gpt-4o",
+                    });
 
-            }); // End of "queue" handler
+                    // Call OpenAI Assistant to generate the monthly summary
+                    const monthlySummaryResult = await generateSummary(
+                        activities, // Pass the raw activities array for this month
+                        openai,
+                        monthlyAssistant.id, // Use global ID
+                        userPromptMonthly,
+                        monthlyFuncSchema // Pass the specific schema for the monthly function
+                    );
 
-            // Handle errors that might occur when initially trying to queue the batch
-            batch.on("error", (err) => {
-                 console.error(`${logPrefix} Error queuing bulk query batch:`, err);
-                 failureMessages.push(`Failed to queue bulk batch: ${err.message}`);
-                 reject(err); // Reject the main promise
-            });
+                    // Store the structured result from the AI function call along with metadata
+                    finalMonthlySummaries[year][month] = {
+                        aiOutput: monthlySummaryResult, // Store the full object from AI
+                        count: activities.length,
+                        startdate: startDate.toISOString().split('T')[0], // Format as YYYY-MM-DD
+                        year: parseInt(year), // Ensure year is number
+                        monthIndex: monthIndex // Store index for quarter calculation
+                    };
+                    console.log(`[${accountId}]   Generated monthly summary for ${month} ${year}.`);
+                }
+            }
+        }
 
-            // Execute the batch (send the SOQL query to Salesforce)
-            console.log(`${logPrefix} Executing batch...`);
-            batch.execute(queryText);
+        // 3. Save Monthly Summaries to Salesforce (if any were generated)
+        // Transform monthly data slightly for saving (extracting HTML summary etc.)
+        const monthlyForSalesforce = {};
+        for (const year in finalMonthlySummaries) {
+             monthlyForSalesforce[year] = {};
+             for (const month in finalMonthlySummaries[year]) {
+                 const monthData = finalMonthlySummaries[year][month];
+                 // Attempt to extract the main HTML summary, provide default if missing
+                 const aiSummary = monthData.aiOutput?.summary || '';
+                 monthlyForSalesforce[year][month] = {
+                     summary: JSON.stringify(monthData.aiOutput), // Keep full JSON
+                     summaryDetails: aiSummary, // Extracted HTML part
+                     count: monthData.count,
+                     startdate: monthData.startdate
+                 };
+             }
+        }
 
-        }); // --- End of Bulk Processing Promise ---
-
-        // --- Close the Bulk Job (Best Practice) ---
-        // No need to await closure if we don't need to guarantee it before proceeding
-        if (bulkJob && bulkJob.id) {
-            console.log(`${logPrefix} Attempting to close bulk job ID: ${bulkJob.id}`);
-            bulkJob.close().then(() => {
-                console.log(`${logPrefix} Bulk job ${bulkJob.id} closed successfully.`);
-            }).catch(closeErr => {
-                // Log warning but don't fail the overall process just for closing error
-                console.warn(`${logPrefix} Failed to close bulk job ID ${bulkJob.id}:`, closeErr.message);
-            });
+        if (Object.keys(monthlyForSalesforce).length > 0 && Object.values(monthlyForSalesforce).some(year => Object.keys(year).length > 0)) {
+            console.log(`[${accountId}] Saving monthly summaries to Salesforce...`);
+            await createTimileSummarySalesforceRecords(conn, monthlyForSalesforce, accountId, 'Monthly', summaryRecordsMap);
+            console.log(`[${accountId}] Monthly summaries saved.`);
+        } else {
+             console.log(`[${accountId}] No monthly summaries generated to save.`);
         }
 
 
-        // 2. Process Quarters Incrementally (Based on aggregated `quarterlyInputs`)
-        // This part remains largely the same as the previous version, as it operates on the
-        // already processed monthly summaries stored in memory (which should be manageable).
-        console.log(`${logPrefix} Processing ${Object.keys(quarterlyInputs).length} quarters based on processed data...`);
-        for (const quarterKey in quarterlyInputs) {
-             const quarterlyLogPrefix = `${logPrefix} -> [Quarter ${quarterKey}]`;
-             let { monthSummaries, year, quarter } = quarterlyInputs[quarterKey];
-             const numMonthlySummaries = monthSummaries?.length || 0;
-             console.log(`${quarterlyLogPrefix} Generating summary using ${numMonthlySummaries} monthly summaries...`);
+        // --- 4. Group Monthly Summaries by Quarter ---
+        console.log(`[${accountId}] Grouping monthly summaries by quarter...`);
+        const quarterlyInputGroups = {}; // Structure: { "YYYY-QX": [ monthlyAiOutput1, monthlyAiOutput2, ... ] }
 
-             if (numMonthlySummaries === 0) {
-                 console.warn(`${quarterlyLogPrefix} Skipping as it has no associated monthly summaries.`);
-                 continue;
-             }
+        for (const year in finalMonthlySummaries) {
+            for (const month in finalMonthlySummaries[year]) {
+                const monthData = finalMonthlySummaries[year][month];
+                const quarter = getQuarterFromMonthIndex(monthData.monthIndex);
+                const quarterKey = `${year}-${quarter}`; // e.g., "2023-Q1"
 
-             // Prepare prompt with aggregated monthly JSON data
-             const quarterlyInputDataString = JSON.stringify(monthSummaries, null, 2);
-             const userPromptQuarterly = `${userPromptQuarterlyTemplate.replace('{{Quarter}}', quarter).replace('{{Year}}', year)}\n\nAggregate the following monthly summary data provided below for ${quarterKey}:\n\`\`\`json\n${quarterlyInputDataString}\n\`\`\``;
+                if (!quarterlyInputGroups[quarterKey]) {
+                    quarterlyInputGroups[quarterKey] = [];
+                }
+                // Push the actual AI output object needed for the quarterly prompt
+                quarterlyInputGroups[quarterKey].push(monthData.aiOutput);
+            }
+        }
+        console.log(`[${accountId}] Identified ${Object.keys(quarterlyInputGroups).length} quarters with data.`);
 
-             // Check if the combined monthly data is excessively large
-             if(quarterlyInputDataString.length > PROMPT_LENGTH_THRESHOLD * 2) { // Arbitrary check, adjust threshold if needed
-                console.warn(`${quarterlyLogPrefix} Combined monthly summaries JSON (${quarterlyInputDataString.length} chars) is very large. Consider optimizing monthly AI output structure or using file input for quarterly stage if memory issues arise here.`);
-             }
 
-             let quarterlyAiOutput = null;
-             let quarterlyAssistant = null;
+        // --- 5. Generate Quarterly Summary for EACH Quarter ---
+        const allQuarterlyRawResults = {}; // Store raw AI output for each quarter { "YYYY-QX": quarterlyAiOutput }
 
-             try {
-                 // Create temporary assistant for this quarterly summary
-                 const assistantName = `Quarterly Summarizer ${accountId} ${quarterKey}-${Date.now()}`;
-                 console.log(`${quarterlyLogPrefix}   Creating Assistant: ${assistantName}`);
-                 quarterlyAssistant = await openai.beta.assistants.create({
-                      name: assistantName,
-                      instructions: "You are an AI assistant specialized in aggregating pre-summarized monthly Salesforce activity data (provided as JSON in the prompt) into a structured quarterly JSON summary for a specific quarter using the provided function 'generate_quarterly_activity_summary'. Consolidate insights and activity lists accurately.",
-                      tools: [{ type: "file_search" }, { type: "function", "function": quarterlyFuncSchema }],
-                      model: OPENAI_MODEL,
-                 });
-                 console.log(`${quarterlyLogPrefix}   Created Assistant ID: ${quarterlyAssistant.id}`);
+        for (const [quarterKey, monthlySummariesForQuarter] of Object.entries(quarterlyInputGroups)) {
+            console.log(`[${accountId}] Generating quarterly summary for ${quarterKey} using ${monthlySummariesForQuarter.length} monthly summaries...`);
 
-                 // Generate the quarterly summary (passing null activities, data is in prompt)
-                 quarterlyAiOutput = await generateSummary(null, openai, quarterlyAssistant.id, userPromptQuarterly, quarterlyFuncSchema, accountId);
-                 console.log(`${quarterlyLogPrefix}   Generated quarterly summary AI output.`);
+             // Check if monthlySummariesForQuarter is not empty before proceeding
+            if (!monthlySummariesForQuarter || monthlySummariesForQuarter.length === 0) {
+                console.warn(`[${accountId}] Skipping ${quarterKey} as it has no associated monthly summaries.`);
+                continue;
+            }
 
-                 // Transform the AI output into Salesforce format
-                 const transformedQuarter = transformQuarterlyStructure(quarterlyAiOutput);
+            // Prepare prompt with the specific monthly summaries for THIS quarter
+            const quarterlyInputDataString = JSON.stringify(monthlySummariesForQuarter, null, 2);
+            const [year, quarter] = quarterKey.split('-'); // Extract year and quarter ID
+            // Make sure the quarterly prompt template clearly asks for aggregation of the provided JSON
+            const userPromptQuarterly = `${userPromptQuarterlyTemplate.replace('{{Quarter}}', quarter).replace('{{Year}}', year)}\n\nAggregate the following monthly summary data provided below for ${quarterKey}:\n\`\`\`json\n${quarterlyInputDataString}\n\`\`\``;
+            const quarterlyAssistant = await openai.beta.assistants.create({
+                name: "Salesforce Quarterly Activities Summarizer",
+                instructions: "You are an AI assistant specialized in aggregating pre-summarized monthly Salesforce activity data (provided as JSON in the prompt) into a structured quarterly JSON summary for a specific quarter using the provided function 'generate_quarterly_activity_summary'. Consolidate insights and activity lists accurately based on the input monthly summaries.",
+                tools: [{ type: "file_search" },{type:"function" , "function" : quarterlyFuncSchema}], // Allows using files
+                model: "gpt-4o",
+            });
+            // Call AI - Pass NULL for activities, data is in the prompt
+            try {
+                 const quarterlySummaryResult = await generateSummary(
+                    null, // No raw activities needed
+                    openai,
+                    quarterlyAssistant.id, // Use global quarterly ID
+                    userPromptQuarterly, // Prompt now contains the monthly summary JSON data
+                    quarterlyFuncSchema // Pass the quarterly schema
+                 );
+                 allQuarterlyRawResults[quarterKey] = quarterlySummaryResult; // Store the raw AI JSON output
+                 console.log(`[${accountId}] Successfully generated quarterly summary for ${quarterKey}.`);
 
-                 // Validate transformation and save to Salesforce
-                 if (transformedQuarter && transformedQuarter[year] && transformedQuarter[year][quarter]) {
-                      const quarterlyForSalesforce = { [year]: { [quarter]: transformedQuarter[year][quarter] } };
-                      console.log(`${quarterlyLogPrefix}   Saving quarterly summary to Salesforce...`);
-                      await createTimileSummarySalesforceRecords(conn, quarterlyForSalesforce, accountId, 'Quarterly', summaryRecordsMap);
-                      console.log(`${quarterlyLogPrefix}   Saved quarterly summary.`);
-                 } else {
-                      // Log warning if transformation failed
-                      console.warn(`${quarterlyLogPrefix} Quarterly summary generated by AI but transform/validation failed. Skipping save.`);
-                      if (overallStatus !== "Failed") { overallStatus = "Partial Success"; } // Mark as partial success
-                      failureMessages.push(`Failed to transform/validate AI output for ${quarterKey}.`);
+            } catch (quarterlyError) {
+                 console.error(`[${accountId}] Failed to generate quarterly summary for ${quarterKey}:`, quarterlyError);
+                 // Log and continue to the next quarter. Consider adding quarterKey to failure callback later.
+            }
+        }
+
+
+        // --- 6. Transform and Consolidate ALL Quarterly Results ---
+        console.log(`[${accountId}] Transforming ${Object.keys(allQuarterlyRawResults).length} generated quarterly summaries...`);
+        const finalQuarterlyDataForSalesforce = {}; // Structure: { year: { QX: { summaryDetails, summaryJson, count, startdate } } }
+
+        for (const [quarterKey, rawAiResult] of Object.entries(allQuarterlyRawResults)) {
+             // `transformQuarterlyStructure` expects the raw AI output format for a single quarter.
+             // It should return { year: { QX: { ... } } } for that single quarter.
+             const transformedResult = transformQuarterlyStructure(rawAiResult);
+
+             // Merge this single-quarter result into the final structure for saving
+             for (const year in transformedResult) {
+                 if (!finalQuarterlyDataForSalesforce[year]) {
+                     finalQuarterlyDataForSalesforce[year] = {};
                  }
-             } catch (quarterlyError) {
-                  // Log errors during quarterly processing
-                  console.error(`${quarterlyLogPrefix} Failed to generate or save quarterly summary:`, quarterlyError.stack);
-                  overallStatus = "Failed"; // Mark overall process as failed
-                  failureMessages.push(`Failed processing ${quarterKey}: ${quarterlyError.message}`);
-             } finally {
-                  // Cleanup Quarterly Assistant
-                  if (quarterlyAssistant?.id) {
-                      try {
-                          console.log(`${quarterlyLogPrefix}   Deleting quarterly assistant ${quarterlyAssistant.id}`);
-                          await openai.beta.assistants.del(quarterlyAssistant.id);
-                          console.log(`${quarterlyLogPrefix}   Deleted quarterly assistant ${quarterlyAssistant.id}`);
-                      } catch (delError) {
-                          console.warn(`${quarterlyLogPrefix}   Could not delete quarterly assistant ${quarterlyAssistant.id}:`, delError.message || delError);
-                       }
-                  }
-                  // Release memory references
-                  if (quarterlyInputs[quarterKey]) quarterlyInputs[quarterKey].monthSummaries = null;
-                  quarterlyAiOutput = null;
-                  monthSummaries = null;
+                 for (const quarter in transformedResult[year]) {
+                     if (!finalQuarterlyDataForSalesforce[year][quarter]) { // Ensure quarter doesn't overwrite if somehow processed twice
+                        finalQuarterlyDataForSalesforce[year][quarter] = transformedResult[year][quarter];
+                     } else {
+                         console.warn(`[${accountId}] Duplicate transformed data found for ${quarter} ${year}. Overwriting is prevented, but check logic.`);
+                     }
+                 }
              }
-        } // --- End of Quarterly Processing Loop ---
+        }
 
 
-        // 3. Send Final Callback Notification
-        console.log(`${logPrefix} Process completed.`);
-        let finalMessage = overallStatus === "Success" ? "Summary Processed Successfully" : `Processing finished with issues: ${failureMessages.join('; ')}`;
-        // Truncate potentially long failure message lists before sending
-        finalMessage = finalMessage.length > 1000 ? finalMessage.substring(0, 997) + "..." : finalMessage;
-        await sendCallbackResponse(accountId, callbackUrl, loggedinUserId, accessToken, overallStatus, finalMessage);
+        // --- 7. Save ALL Generated Quarterly Summaries to Salesforce ---
+         if (Object.keys(finalQuarterlyDataForSalesforce).length > 0 && Object.values(finalQuarterlyDataForSalesforce).some(year => Object.keys(year).length > 0)) {
+            const totalQuarterlyRecords = Object.values(finalQuarterlyDataForSalesforce).reduce((sum, year) => sum + Object.keys(year).length, 0);
+            console.log(`[${accountId}] Saving ${totalQuarterlyRecords} quarterly summaries to Salesforce...`);
+            await createTimileSummarySalesforceRecords(conn, finalQuarterlyDataForSalesforce, accountId, 'Quarterly', summaryRecordsMap);
+            console.log(`[${accountId}] Quarterly summaries saved.`);
+        } else {
+             console.log(`[${accountId}] No quarterly summaries generated or transformed to save.`);
+        }
+
+
+        // --- 8. Send Success Callback ---
+        // Consider if partial success needs a different message
+        console.log(`[${accountId}] Process completed.`);
+        await sendCallbackResponse(accountId, callbackUrl, loggedinUserId, accessToken, "Success", "Summary Processed Successfully"); // Adjust message if needed for partial failures
 
     } catch (error) {
-        // Catch errors from the main processing flow (e.g., bulk job setup, promise rejection)
-        console.error(`${logPrefix} Critical error during summary processing:`, error.stack);
-        // Ensure a failure callback is sent for critical errors
-        await sendCallbackResponse(accountId, callbackUrl, loggedinUserId, accessToken, "Failed", `Critical processing error: ${error.message}`);
-        // Attempt to abort/close the job if it exists and a critical error occurred
-        if (bulkJob && bulkJob.id) {
-            try {
-                console.warn(`${logPrefix} Attempting to abort/close bulk job ${bulkJob.id} due to critical error...`);
-                // Use abort() if job might be running, close() if likely completed/failed state
-                await bulkJob.abort(); // More likely to stop an ongoing job
-                console.log(`${logPrefix} Bulk job aborted.`);
-            } catch (abortErr) {
-                 try { // Fallback to close if abort fails (e.g., job already finished)
-                     await bulkJob.close();
-                     console.log(`${logPrefix} Bulk job closed.`);
-                 } catch(closeErr) {
-                    console.warn(`${logPrefix} Failed to abort/close bulk job ${bulkJob.id} after error:`, closeErr.message);
-                 }
-            }
-        }
-    } finally {
-         console.log(`${logPrefix} processSummary finished execution.`);
-         // Optional final GC & memory log
-        //  if (global.gc) { console.log(`${logPrefix} Triggering final GC.`); global.gc(); }
-        //  console.log(`${logPrefix} Final memory usage:`, process.memoryUsage());
+        // Catch errors from any step (fetch, AI calls, save, transform)
+        console.error(`[${accountId}] Error during summary processing:`, error);
+        await sendCallbackResponse(accountId, callbackUrl, loggedinUserId, accessToken, "Failed", `Processing error: ${error.message}`);
     }
 }
 
 
-// --- OpenAI Summary Generation Function (Includes conditional input) ---
-// Handles interaction with OpenAI Assistants API for a given batch/prompt
+// --- OpenAI Summary Generation Function ---
 async function generateSummary(
-    activities, // Array of raw activities OR null
+    activities, // Array of raw activities OR null (if data is already embedded in prompt)
     openaiClient,
-    assistantId,
-    userPrompt,
-    functionSchema,
-    accountId = 'N/A' // For logging context
+    assistantId, // Accepts the ID dynamically
+    userPrompt, // The base user prompt template
+    functionSchema // The specific function schema object for this call
 ) {
     let fileId = null;
     let thread = null;
-    let tempFilePath = null;
-    let inputMethod = "prompt";
-    let logPrefix = `[AI ${accountId} Thread New]`; // Initial log prefix
+    let filePath = null; // For temporary file path
+    let inputMethod = "prompt"; // Default input method
+    const PROMPT_LENGTH_THRESHOLD = 256000; // Define the character limit
 
     try {
-        // 1. Create a new Thread for this interaction
+        // Step 1: Create an OpenAI Thread
         thread = await openaiClient.beta.threads.create();
-        logPrefix = `[AI ${accountId} Thread ${thread.id}]`; // Update log prefix with Thread ID
-        console.log(`${logPrefix} Created for Assistant ${assistantId}`);
+        console.log(`[Thread ${thread.id}] Created for Assistant ${assistantId}`);
 
-        let finalUserPrompt = userPrompt;
-        let messageAttachments = []; // For potential file uploads
+        let finalUserPrompt = userPrompt; // Start with the base prompt
+        let messageAttachments = []; // Attachments for the message (e.g., file IDs)
 
-        // 2. Determine Input Method (Direct JSON vs. File Upload)
+        // Step 2: Determine Input Method based on activities array AND prompt length
         if (activities && Array.isArray(activities) && activities.length > 0) {
+            // --- Tentatively construct the prompt with direct JSON ---
             let potentialFullPrompt;
             let activitiesJsonString;
-
             try {
-                 // Stringify minimally for length check first
-                 activitiesJsonString = JSON.stringify(activities);
-                 potentialFullPrompt = `${userPrompt}\n\nActivity data:\n\`\`\`json\n${activitiesJsonString}\n\`\`\``;
-                 console.log(`${logPrefix} Potential prompt length with direct JSON: ${potentialFullPrompt.length} chars.`);
+                 // Stringify first to check length accurately
+                 activitiesJsonString = JSON.stringify(activities, null, 2); // Pretty print adds some length
+                 potentialFullPrompt = `${userPrompt}\n\nHere is the activity data to process:\n\`\`\`json\n${activitiesJsonString}\n\`\`\``;
+                 console.log(`[Thread ${thread.id}] Potential prompt length with direct JSON: ${potentialFullPrompt.length} characters.`);
             } catch(stringifyError) {
-                console.error(`${logPrefix} Error stringifying activities for length check:`, stringifyError);
+                console.error(`[Thread ${thread.id}] Error stringifying activities for length check:`, stringifyError);
+                // Decide how to handle - perhaps default to file upload or throw
                 throw new Error("Failed to stringify activity data for processing.");
             }
 
-            // Use direct JSON if below thresholds
-            if (potentialFullPrompt.length < PROMPT_LENGTH_THRESHOLD && activities.length < DIRECT_INPUT_THRESHOLD) {
+
+            // --- Check length against the threshold ---
+            if (potentialFullPrompt.length < PROMPT_LENGTH_THRESHOLD && activities.length <= DIRECT_INPUT_THRESHOLD) {
+                // --- Method: Direct JSON Input ---
                 inputMethod = "direct JSON";
-                // Use pretty-printed JSON in the final prompt
-                finalUserPrompt = `${userPrompt}\n\nActivity data:\n\`\`\`json\n${JSON.stringify(activities, null, 2)}\n\`\`\``;
-                console.log(`${logPrefix} Using direct JSON input (${activities.length} activities).`);
+                finalUserPrompt = potentialFullPrompt; // Use the combined prompt
+                console.log(`[Thread ${thread.id}] Using direct JSON input (Prompt length ${potentialFullPrompt.length} < ${PROMPT_LENGTH_THRESHOLD}).`);
+                // No file upload needed, messageAttachments remains empty
+
             } else {
-                // Use file upload if thresholds exceeded
+                // --- Method: File Upload Input (Prompt too long) ---
                 inputMethod = "file upload";
-                console.log(`${logPrefix} Using file upload (Activities: ${activities.length} >= ${DIRECT_INPUT_THRESHOLD} or Prompt Length: ${potentialFullPrompt.length} >= ${PROMPT_LENGTH_THRESHOLD}).`);
-                finalUserPrompt = userPrompt; // Use base prompt only
+                console.log(`[Thread ${thread.id}] Using file upload (Potential prompt length ${potentialFullPrompt.length} >= ${PROMPT_LENGTH_THRESHOLD}).`);
+                // **IMPORTANT**: Use the *original* base userPrompt, not the one with JSON appended
+                finalUserPrompt = userPrompt;
 
-                // Convert activities to plain text for the file
+                 // --- Convert activities to Plain Text for file_search compatibility ---
                 let activitiesText = activities.map((activity, index) => {
-                    let desc = activity.Description || 'No Description';
-                    let subj = activity.Subject || 'No Subject';
-                    return `Activity ${index + 1} (ID: ${activity.Id || 'N/A'}):\n  ActivityDate: ${activity.ActivityDate || 'N/A'}\n  Subject: ${subj}\n  Description: ${desc}`;
+                    let activityLines = [`Activity ${index + 1}:`];
+                    for (const [key, value] of Object.entries(activity)) {
+                        let displayValue = typeof value === 'object' ? JSON.stringify(value) : value;
+                        activityLines.push(`  ${key}: ${displayValue}`);
+                    }
+                    return activityLines.join('\n');
                 }).join('\n\n---\n\n');
+                // ---------------------------------------------------------------------
 
-                // Create and write temporary file
+                // Create a temporary local file (.txt extension)
                 const timestamp = new Date().toISOString().replace(/[:.-]/g, "_");
-                const filename = `activities_${accountId}_${timestamp}_${thread.id}.txt`;
-                tempFilePath = path.join(TEMP_FILE_DIR, filename);
-                await fs.writeFile(tempFilePath, activitiesText);
-                console.log(`${logPrefix} Temporary text file generated: ${tempFilePath}`);
+                // *** USE .txt EXTENSION ***
+                const filename = `salesforce_activities_${timestamp}_${thread.id}.json`;
+                filePath = path.join(__dirname, filename); // Or TEMP_FILE_DIR
+                await fs.ensureDir(path.dirname(filePath)); // Ensure directory exists
 
-                // Upload file to OpenAI
-                const fileStream = fs.createReadStream(tempFilePath);
-                const uploadResponse = await openaiClient.files.create({ file: fileStream, purpose: "assistants"});
+                // *** WRITE THE TEXT STRING ***
+                await fs.writeFile(filePath, activitiesText);
+                console.log(`[Thread ${thread.id}] Temporary text file generated: ${filePath}`);
+
+                // Upload the file to OpenAI
+                const uploadResponse = await openaiClient.files.create({
+                    file: fs.createReadStream(filePath),
+                    purpose: "assistants", // Use 'assistants' purpose
+                });
                 fileId = uploadResponse.id;
-                console.log(`${logPrefix} File uploaded to OpenAI: ${fileId}`);
+                console.log(`[Thread ${thread.id}] File uploaded to OpenAI: ${fileId}`);
 
-                // Prepare attachment for the message
+                // Prepare attachment for the message, linking the file and specifying the tool
+                // *** Ensure file_search is used if that's the intent for large data ***
                 messageAttachments.push({ file_id: fileId, tools: [{ type: "file_search" }] });
-                console.log(`${logPrefix} Attaching file ${fileId} with file_search tool.`);
-                finalUserPrompt += "\n\nPlease analyze the activity data provided in the attached file."; // Instruct AI
+                console.log(`[Thread ${thread.id}] Attaching file ${fileId} with file_search tool.`);
             }
         } else {
-             // No activities provided (e.g., quarterly summary)
-             console.log(`${logPrefix} No activities array provided. Using prompt content as is.`);
+             // Case where activities is null or empty (e.g., quarterly call where data is already in prompt)
+             console.log(`[Thread ${thread.id}] No activities array provided or array is empty. Using prompt content as is.`);
+             // finalUserPrompt is already set to userPrompt, messageAttachments is empty
         }
 
-        // 3. Add Message to Thread
-        const messagePayload = { role: "user", content: finalUserPrompt };
+        // Step 3: Add the User Message to the Thread
+        const messagePayload = {
+            role: "user",
+            content: finalUserPrompt, // Use the final prompt (either base or combined)
+        };
         if (messageAttachments.length > 0) {
             messagePayload.attachments = messageAttachments;
         }
-        const message = await openaiClient.beta.threads.messages.create(thread.id, messagePayload);
-        console.log(`${logPrefix} Message added (using ${inputMethod}). ID: ${message.id}`);
 
-        // 4. Run Assistant and Poll for Result
-        console.log(`${logPrefix} Starting run, forcing function: ${functionSchema.name}`);
+        const message = await openaiClient.beta.threads.messages.create(thread.id, messagePayload);
+        console.log(`[Thread ${thread.id}] Message added (using ${inputMethod}). ID: ${message.id}`);
+
+        // Step 4: Run the Assistant - CRITICAL: Force the specific function via tool_choice
+        console.log(`[Thread ${thread.id}] Starting run, forcing function: ${functionSchema.name}`);
         const run = await openaiClient.beta.threads.runs.createAndPoll(thread.id, {
             assistant_id: assistantId,
-            tools: [{ type: "function", function: functionSchema }], // Provide schema for this run
-            tool_choice: { type: "function", function: { name: functionSchema.name } }, // Force function call
+            // IMPORTANT: Pass ONLY the required function schema in tools for this specific run
+            // Note: If using file_search, the assistant might *also* need the file_search tool enabled here or at assistant level
+            // Let's assume the assistant *already has* file_search enabled if needed. We only specify the function tool for this run's *primary* action.
+            tools: [{ type: "function", function: functionSchema }],
+            // Explicitly tell the Assistant it MUST call this specific function
+            tool_choice: { type: "function", function: { name: functionSchema.name } },
         });
-        console.log(`${logPrefix} Run status: ${run.status}`);
+        console.log(`[Thread ${thread.id}] Run status: ${run.status}`);
 
-        // 5. Process Run Outcome
+        // Step 5: Process the Run Outcome (No changes needed here from previous version)
         if (run.status === 'requires_action') {
-            // Extract and validate tool call arguments
             const toolCalls = run.required_action?.submit_tool_outputs?.tool_calls;
-            if (!toolCalls || toolCalls.length === 0 || !toolCalls[0]?.function?.arguments) {
-                 console.error(`${logPrefix} Run requires action, but tool call data is missing or invalid.`, run.required_action);
+            if (!toolCalls || toolCalls.length === 0) {
+                 console.error(`[Thread ${thread.id}] Run requires action, but tool call data is missing or empty.`, run);
                  throw new Error("Function call was expected but not provided correctly by the Assistant.");
              }
              const toolCall = toolCalls[0];
              if (toolCall.function.name !== functionSchema.name) {
-                  console.error(`${logPrefix} Assistant called the wrong function. Expected: ${functionSchema.name}, Got: ${toolCall.function.name}`);
+                  console.error(`[Thread ${thread.id}] Assistant called the wrong function. Expected: ${functionSchema.name}, Got: ${toolCall.function.name}`);
                   throw new Error(`Assistant called the wrong function: ${toolCall.function.name}`);
              }
              const rawArgs = toolCall.function.arguments;
-             console.log(`${logPrefix} Function call arguments received for ${toolCall.function.name}. Length: ${rawArgs.length}`);
+             console.log(`[Thread ${thread.id}] Function call arguments received for ${toolCall.function.name}. Raw (truncated): ${rawArgs.substring(0,200)}...`);
              try {
-                 // Parse the JSON arguments
                  const summaryObj = JSON.parse(rawArgs);
-                 console.log(`${logPrefix} Successfully parsed function arguments.`);
-                 return summaryObj; // Return the structured data
+                 console.log(`[Thread ${thread.id}] Successfully parsed function arguments.`);
+                 return summaryObj;
              } catch (parseError) {
-                 console.error(`${logPrefix} Failed to parse function call arguments JSON:`, parseError);
-                 console.error(`${logPrefix} Raw arguments received (first 500 chars):`, rawArgs.substring(0, 500));
+                 console.error(`[Thread ${thread.id}] Failed to parse function call arguments JSON:`, parseError);
+                 console.error(`[Thread ${thread.id}] Raw arguments received:`, rawArgs);
                  throw new Error(`Failed to parse function call arguments from AI: ${parseError.message}`);
              }
          } else if (run.status === 'completed') {
-              // Handle unexpected completion (should have required action)
-              console.warn(`${logPrefix} Run completed without requiring function call action, despite tool_choice forcing ${functionSchema.name}.`);
-              try { // Log last assistant message for debugging
-                const messages = await openaiClient.beta.threads.messages.list(run.thread_id, { order: 'desc', limit: 1 });
-                const lastMessageContent = messages.data[0]?.content[0]?.text?.value || "No text content found.";
-                console.warn(`${logPrefix} Last message content from Assistant: ${lastMessageContent.substring(0, 500)}...`);
-              } catch (msgError) {
-                  console.warn(`${logPrefix} Could not retrieve last message for completed run: ${msgError.message}`);
-              }
+              console.warn(`[Thread ${thread.id}] Run completed without requiring function call action, despite tool_choice forcing ${functionSchema.name}.`);
+              const messages = await openaiClient.beta.threads.messages.list(run.thread_id, { limit: 1 });
+              const lastMessageContent = messages.data[0]?.content[0]?.text?.value || "No text content found.";
+              console.warn(`[Thread ${thread.id}] Last message content from Assistant: ${lastMessageContent}`);
               throw new Error(`Assistant run completed without making the required function call to ${functionSchema.name}.`);
          } else {
-             // Handle failed, cancelled, expired runs
-             console.error(`${logPrefix} Run failed or ended unexpectedly. Status: ${run.status}`, run.last_error || run.incomplete_details);
-             const errorMessage = run.last_error ? `${run.last_error.code}: ${run.last_error.message}` : (run.incomplete_details?.reason || 'Unknown error');
+             console.error(`[Thread ${thread.id}] Run failed or ended unexpectedly. Status: ${run.status}`, run.last_error);
+             const errorMessage = run.last_error ? `${run.last_error.code}: ${run.last_error.message}` : 'Unknown error';
              throw new Error(`Assistant run failed. Status: ${run.status}. Error: ${errorMessage}`);
          }
 
     } catch (error) {
-        // Catch errors from any step in the AI interaction
-        logPrefix = `[AI ${accountId} Thread ${thread?.id || 'N/A'}]`; // Ensure prefix is set even if thread creation failed
-        console.error(`${logPrefix} Error in generateSummary: ${error.message}`);
-        console.error(error.stack); // Log stack trace
-        throw error; // Re-throw
+        console.error(`[Thread ${thread?.id || 'N/A'}] Error in generateSummary: ${error.message}`);
+        throw error;
     } finally {
-        // 6. Cleanup Resources (Temp file, OpenAI file)
-        logPrefix = `[AI ${accountId} Thread ${thread?.id || 'Cleanup'}]`; // Use thread ID if available
-        if (tempFilePath) {
+        // Step 6: Cleanup - Ensure temporary files and OpenAI files are deleted
+        // *** Ensure correct filePath (which might be .txt now) is deleted ***
+        if (filePath) {
             try {
-                await fs.unlink(tempFilePath);
-                console.log(`${logPrefix} Deleted temporary file: ${tempFilePath}`);
+                await fs.unlink(filePath);
+                console.log(`[Thread ${thread?.id || 'N/A'}] Deleted temporary file: ${filePath}`);
             } catch (unlinkError) {
-                console.error(`${logPrefix} Error deleting temporary file ${tempFilePath}:`, unlinkError);
+                console.error(`[Thread ${thread?.id || 'N/A'}] Error deleting temporary file ${filePath}:`, unlinkError);
             }
         }
-        if (fileId) {
+        if (fileId) { // If a file was uploaded to OpenAI
             try {
                 await openaiClient.files.del(fileId);
-                console.log(`${logPrefix} Deleted OpenAI file: ${fileId}`);
+                console.log(`[Thread ${thread?.id || 'N/A'}] Deleted OpenAI file: ${fileId}`);
             } catch (deleteError) {
                  if (!(deleteError instanceof NotFoundError || deleteError?.status === 404)) {
-                    console.error(`${logPrefix} Error deleting OpenAI file ${fileId}:`, deleteError.message || deleteError);
+                    console.error(`[Thread ${thread?.id || 'N/A'}] Error deleting OpenAI file ${fileId}:`, deleteError.message || deleteError);
                  } else {
-                     console.log(`${logPrefix} OpenAI file ${fileId} already deleted or not found.`);
+                     console.log(`[Thread ${thread?.id || 'N/A'}] OpenAI file ${fileId} already deleted or not found.`);
                  }
             }
         }
-        // Optional: Delete thread
-        // if (thread?.id) { /* ... delete thread ... */ }
     }
 }
 
+// // --- OpenAI Summary Generation Function ---
+// async function generateSummary(
+//     activities, // Array of raw activities OR null (if data is already embedded in prompt)
+//     openaiClient,
+//     assistantId, // Accepts the ID dynamically
+//     userPrompt,
+//     functionSchema // The specific function schema object for this call
+// ) {
+//     let fileId = null;
+//     let thread = null;
+//     let filePath = null; // For temporary file path
+//     let inputMethod = "prompt"; // Default input method
 
-// --- Salesforce Record Creation/Update Function (Bulk API) ---
-// Saves generated summaries (monthly or quarterly) to Salesforce
+//     try {
+//         // Step 1: Create an OpenAI Thread
+//         thread = await openaiClient.beta.threads.create();
+//         console.log(`[Thread ${thread.id}] Created for Assistant ${assistantId}`);
+
+//         let finalUserPrompt = userPrompt; // Base prompt
+//         let messageAttachments = []; // Attachments for the message (e.g., file IDs)
+
+//         // Step 2: Determine Input Method based on activities array
+//         if (activities && Array.isArray(activities) && activities.length > 0) {
+//             if (activities.length < DIRECT_INPUT_THRESHOLD) {
+//                 // --- Method: Direct JSON Input ---
+//                 inputMethod = "direct JSON";
+//                 console.log(`[Thread ${thread.id}] Using direct JSON input (${activities.length} activities < ${DIRECT_INPUT_THRESHOLD}).`);
+//                 const activitiesJsonString = JSON.stringify(activities, null, 2); // Pretty print for AI readability
+//                 // Append the JSON data directly to the prompt content
+//                 finalUserPrompt += `\n\nHere is the activity data to process:\n\`\`\`json\n${activitiesJsonString}\n\`\`\``;
+//             } else {
+//                 // --- Method: File Upload Input ---
+//                 inputMethod = "file upload";
+//                 console.log(`[Thread ${thread.id}] Using file upload (${activities.length} activities >= ${DIRECT_INPUT_THRESHOLD}).`);
+//                 // Create a temporary local file
+//                 const timestamp = new Date().toISOString().replace(/[:.-]/g, "_");
+//                 const filename = `salesforce_activities_${timestamp}_${thread.id}.json`;
+//                 //filePath = path.join(TEMP_FILE_DIR); // Store in the temp directory
+//                 filePath = path.join(__dirname, filename);
+//                 await fs.ensureDir(path.dirname(filePath)); // Ensure the temp directory exists
+//                 await fs.writeJson(filePath, activities); // Write activities array as JSON
+//                 console.log(`[Thread ${thread.id}] Temporary file generated: ${filePath}`);
+
+//                 // Upload the file to OpenAI
+//                 const uploadResponse = await openaiClient.files.create({
+//                     file: fs.createReadStream(filePath),
+//                     purpose: "assistants", // Use 'assistants' purpose
+//                 });
+//                 fileId = uploadResponse.id;
+//                 console.log(`[Thread ${thread.id}] File uploaded to OpenAI: ${fileId}`);
+
+//                 // Prepare attachment for the message, linking the file and specifying the tool
+//                 messageAttachments.push({ file_id: fileId, tools: [{ type: "file_search" }] });
+//             }
+//         } else {
+//              // Case where activities is null or empty (e.g., quarterly call)
+//              console.log(`[Thread ${thread.id}] No activities array provided or array is empty. Using prompt content as is.`);
+//         }
+
+//         // Step 3: Add the User Message to the Thread
+//         const messagePayload = {
+//             role: "user",
+//             content: finalUserPrompt, // Use the potentially modified prompt
+//         };
+//         if (messageAttachments.length > 0) {
+//             messagePayload.attachments = messageAttachments;
+//         }
+
+//         const message = await openaiClient.beta.threads.messages.create(thread.id, messagePayload);
+//         console.log(`[Thread ${thread.id}] Message added (using ${inputMethod}). ID: ${message.id}`);
+
+//         // Step 4: Run the Assistant - CRITICAL: Force the specific function via tool_choice
+//         console.log(`[Thread ${thread.id}] Starting run, forcing function: ${functionSchema.name}`);
+//         const run = await openaiClient.beta.threads.runs.createAndPoll(thread.id, {
+//             assistant_id: assistantId,
+//             // IMPORTANT: Pass ONLY the required function schema in tools for this specific run
+//             tools: [{ type: "function", function: functionSchema }],
+//             // Explicitly tell the Assistant it MUST call this specific function
+//             tool_choice: { type: "function", function: { name: functionSchema.name } },
+//             // temperature: 0 // Optional: Set temperature to 0 for more deterministic output format
+//         });
+//         console.log(`[Thread ${thread.id}] Run status: ${run.status}`);
+
+//         // Step 5: Process the Run Outcome
+//         if (run.status === 'requires_action') {
+//             // Check if the required action involves the expected tool call
+//             const toolCalls = run.required_action?.submit_tool_outputs?.tool_calls;
+//             if (!toolCalls || toolCalls.length === 0) {
+//                 console.error(`[Thread ${thread.id}] Run requires action, but tool call data is missing or empty.`, run);
+//                 throw new Error("Function call was expected but not provided correctly by the Assistant.");
+//             }
+
+//             // Assuming only one tool call is expected per run in this setup
+//             const toolCall = toolCalls[0];
+
+//             // Verify the correct function was called (important sanity check)
+//             if (toolCall.function.name !== functionSchema.name) {
+//                  console.error(`[Thread ${thread.id}] Assistant called the wrong function. Expected: ${functionSchema.name}, Got: ${toolCall.function.name}`);
+//                  throw new Error(`Assistant called the wrong function: ${toolCall.function.name}`);
+//             }
+
+//             const rawArgs = toolCall.function.arguments;
+//             console.log(`[Thread ${thread.id}] Function call arguments received for ${toolCall.function.name}. Raw (truncated): ${rawArgs.substring(0,200)}...`);
+//             try {
+//                 // Parse the JSON arguments returned by the function call
+//                 const summaryObj = JSON.parse(rawArgs);
+//                 console.log(`[Thread ${thread.id}] Successfully parsed function arguments.`);
+//                 // We don't need to submit back tool outputs here, just return the parsed arguments
+//                 return summaryObj;
+//             } catch (parseError) {
+//                 console.error(`[Thread ${thread.id}] Failed to parse function call arguments JSON:`, parseError);
+//                 console.error(`[Thread ${thread.id}] Raw arguments received:`, rawArgs);
+//                 throw new Error(`Failed to parse function call arguments from AI: ${parseError.message}`);
+//             }
+//         } else if (run.status === 'completed') {
+//              // This is unexpected when tool_choice forces a function
+//              console.warn(`[Thread ${thread.id}] Run completed without requiring function call action, despite tool_choice forcing ${functionSchema.name}. Check Assistant instructions or prompt clarity.`);
+//              // Log the last message to understand what happened
+//              const messages = await openaiClient.beta.threads.messages.list(run.thread_id, { limit: 1 });
+//              const lastMessageContent = messages.data[0]?.content[0]?.text?.value || "No text content found.";
+//              console.warn(`[Thread ${thread.id}] Last message content from Assistant: ${lastMessageContent}`);
+//              throw new Error(`Assistant run completed without making the required function call to ${functionSchema.name}.`);
+//         } else {
+//             // Handle other terminal statuses: 'failed', 'cancelled', 'expired'
+//             console.error(`[Thread ${thread.id}] Run failed or ended unexpectedly. Status: ${run.status}`, run.last_error);
+//             const errorMessage = run.last_error ? `${run.last_error.code}: ${run.last_error.message}` : 'Unknown error';
+//             throw new Error(`Assistant run failed. Status: ${run.status}. Error: ${errorMessage}`);
+//         }
+
+//     } catch (error) {
+//         // Catch errors from thread creation, message sending, run execution, etc.
+//         console.error(`[Thread ${thread?.id || 'N/A'}] Error in generateSummary: ${error.message}`);
+//         throw error; // Re-throw the error to be caught by the calling function (processSummary)
+//     } finally {
+//         // Step 6: Cleanup - Ensure temporary files and OpenAI files are deleted
+//         if (filePath) { // If a temporary local file was created
+//             try {
+//                 await fs.unlink(filePath);
+//                 console.log(`[Thread ${thread?.id || 'N/A'}] Deleted temporary file: ${filePath}`);
+//             } catch (unlinkError) {
+//                 // Log error but don't necessarily fail the entire process
+//                 console.error(`[Thread ${thread?.id || 'N/A'}] Error deleting temporary file ${filePath}:`, unlinkError);
+//             }
+//         }
+//         if (fileId) { // If a file was uploaded to OpenAI
+//             try {
+//                 await openaiClient.files.del(fileId);
+//                 console.log(`[Thread ${thread?.id || 'N/A'}] Deleted OpenAI file: ${fileId}`);
+//             } catch (deleteError) {
+//                 // Log error but continue; failing to delete shouldn't stop the summary process
+//                  // Check if the error is ignorable (e.g., file already deleted)
+//                  if (!(deleteError instanceof NotFoundError || deleteError?.status === 404)) {
+//                     console.error(`[Thread ${thread?.id || 'N/A'}] Error deleting OpenAI file ${fileId}:`, deleteError.message || deleteError);
+//                  } else {
+//                      console.log(`[Thread ${thread?.id || 'N/A'}] OpenAI file ${fileId} already deleted or not found.`);
+//                  }
+//             }
+//         }
+//         // Optional: Delete thread? Usually not needed unless specifically managing resources.
+//         // if (thread) { try { await openaiClient.beta.threads.del(thread.id); console.log(`[Thread ${thread.id}] Deleted thread.`); } catch (e) { /* log */ } }
+//     }
+// }
+
+
+// --- Salesforce Record Creation/Update Function ---
 async function createTimileSummarySalesforceRecords(conn, summaries, parentId, summaryCategory, summaryRecordsMap) {
-    const logPrefix = `[SF Save ${parentId} ${summaryCategory}]`;
-    console.log(`${logPrefix} Preparing to save summaries...`);
+    console.log(`[${parentId}] Preparing to save ${summaryCategory} summaries...`);
     let recordsToCreate = [];
     let recordsToUpdate = [];
 
-    // Iterate through the summaries data structure: { year: { periodKey: { summaryData } } }
+    // Iterate through the summaries structure { year: { periodKey: { summaryJson, summaryDetails, count, startdate } } }
     for (const year in summaries) {
-        for (const periodKey in summaries[year]) {
+        for (const periodKey in summaries[year]) { // periodKey is 'MonthName' or 'Q1', 'Q2' etc.
             const summaryData = summaries[year][periodKey];
-            let summaryJsonString = summaryData.summaryJson || summaryData.summary; // Full AI JSON
-            let summaryDetailsHtml = summaryData.summaryDetails || ''; // HTML summary
-            let startDate = summaryData.startdate; // YYYY-MM-DD
-            let count = summaryData.count; // Activity count for this period/batch
 
-             // Attempt to extract HTML summary from JSON if needed
+            // Extract data from the summary object for this period
+            let summaryJsonString = summaryData.summaryJson || summaryData.summary; // Full AI response JSON
+            let summaryDetailsHtml = summaryData.summaryDetails || ''; // Extracted HTML summary
+            let startDate = summaryData.startdate; // Should be YYYY-MM-DD
+            let count = summaryData.count;
+
+            // Fallback: Try to extract HTML from the full JSON if details field is empty
              if (!summaryDetailsHtml && summaryJsonString) {
                 try {
                     const parsedJson = JSON.parse(summaryJsonString);
-                    summaryDetailsHtml = parsedJson.summary || parsedJson?.yearlySummary?.[0]?.quarters?.[0]?.summary || '';
+                    // Adjust path based on the actual structure returned by your AI function schema
+                    summaryDetailsHtml = parsedJson.summary || ''; // Assumes top-level 'summary' key holds HTML
                 } catch (e) {
-                    console.warn(`${logPrefix} Could not parse 'summaryJsonString' for ${periodKey} ${year} to extract HTML details.`);
+                    console.warn(`[${parentId}] Could not parse 'summaryJsonString' for ${periodKey} ${year} to extract HTML details. HTML field might be empty.`);
+                    // Keep summaryDetailsHtml as empty string if parsing fails
                  }
             }
 
-            // Determine specific fields based on category (Monthly/Quarterly)
+            // Determine Salesforce field values based on category
             let fyQuarterValue = (summaryCategory === 'Quarterly') ? periodKey : '';
             let monthValue = (summaryCategory === 'Monthly') ? periodKey : '';
+            // Create a consistent key for looking up existing records
             let shortMonth = monthValue ? monthValue.substring(0, 3) : '';
             let summaryMapKey = (summaryCategory === 'Quarterly') ? `${fyQuarterValue} ${year}` : `${shortMonth} ${year}`;
+
+            // Check if an existing record ID was provided for this period
             let existingRecordId = getValueByKey(summaryRecordsMap, summaryMapKey);
 
-            // Prepare the payload for the Salesforce record
-            // Ensure API names match your Timeline_Summary__c object fields
+            // --- Prepare Salesforce Record Payload ---
+            // IMPORTANT: Use the EXACT API names of your fields in Timeline_Summary__c
             const recordPayload = {
-                Account__c: parentId, // Assumes standard Account lookup
-                Month__c: monthValue || null,
-                Year__c: String(year),
-                Summary_Category__c: summaryCategory,
-                // Use substring to avoid exceeding Salesforce field length limits (e.g., 131072)
-                Summary__c: summaryJsonString ? summaryJsonString.substring(0, 131070) : null,
-                Summary_Details__c: summaryDetailsHtml ? summaryDetailsHtml.substring(0, 131070) : null,
-                FY_Quarter__c: fyQuarterValue || null,
-                Month_Date__c: startDate,
-                Number_of_Records__c: count,
+                Parent_Id__c: parentId, // Lookup to parent record (e.g., Account)
+                Month__c: monthValue, // Text field for month name
+                Year__c: String(year), // Text or Number field for year
+                Summary_Category__c: summaryCategory, // Picklist ('Monthly', 'Quarterly')
+                Summary__c: summaryJsonString ? summaryJsonString.substring(0, 131072) : null, // Long Text Area (check limit)
+                Summary_Details__c: summaryDetailsHtml ? summaryDetailsHtml.substring(0, 131072) : null, // Rich Text Area (check limit)
+                FY_Quarter__c: fyQuarterValue, // Text field for quarter (e.g., 'Q1')
+                Month_Date__c: startDate, // Date field for the start of the period
+                Number_of_Records__c: count, // Number field for activity count
+                Account__c: parentId // Assuming Account lookup relationship field API name
             };
 
-             // Basic validation
-             if (!recordPayload.Account__c || !recordPayload.Summary_Category__c || !recordPayload.Year__c) {
-                 console.warn(`${logPrefix} Skipping record for ${summaryMapKey} - missing Account ID, Category, or Year.`);
+             // Basic validation before adding
+             if (!recordPayload.Parent_Id__c || !recordPayload.Summary_Category__c) {
+                 console.warn(`[${parentId}] Skipping record for ${summaryMapKey} due to missing Parent ID or Category.`);
                  continue;
              }
 
-            // Decide whether to create or update
+            // Add to appropriate list for bulk operation
             if (existingRecordId) {
-                console.log(`${logPrefix}   Queueing update for ${summaryMapKey} (ID: ${existingRecordId})`);
+                console.log(`[${parentId}]   Queueing update for ${summaryMapKey} (ID: ${existingRecordId})`);
                 recordsToUpdate.push({ Id: existingRecordId, ...recordPayload });
             } else {
-                console.log(`${logPrefix}   Queueing create for ${summaryMapKey}`);
+                console.log(`[${parentId}]   Queueing create for ${summaryMapKey}`);
                 recordsToCreate.push(recordPayload);
             }
         }
     }
 
-    // Perform Salesforce DML using Bulk API
+    // --- Perform Bulk DML Operations ---
     try {
-        const options = { allOrNone: false }; // Allow partial success
+        // Use allOrNone=false to allow partial success
+        const options = { allOrNone: false };
 
-        // Bulk Insert
         if (recordsToCreate.length > 0) {
-            console.log(`${logPrefix} Creating ${recordsToCreate.length} new records via bulk API...`);
+            console.log(`[${parentId}] Creating ${recordsToCreate.length} new ${summaryCategory} summary records via bulk API...`);
+            // Use bulk API for better performance with many records
             const createResults = await conn.bulk.load(TIMELINE_SUMMARY_OBJECT_API_NAME, "insert", options, recordsToCreate);
-            console.log(`${logPrefix} Bulk create results received (${createResults.length}).`);
+            console.log(`[${parentId}] Bulk create results received (${createResults.length}).`);
             createResults.forEach((res, index) => {
                 if (!res.success) {
-                    const recordIdentifier = recordsToCreate[index].Month__c || recordsToCreate[index].FY_Quarter__c;
-                    console.error(`${logPrefix} Error creating record ${index + 1} (${recordIdentifier} ${recordsToCreate[index].Year__c}):`, JSON.stringify(res.errors));
+                    console.error(`[${parentId}] Error creating record ${index + 1} (${recordsToCreate[index].Month__c || recordsToCreate[index].FY_Quarter__c} ${recordsToCreate[index].Year__c}):`, res.errors);
+                } else {
+                    // Optional: Log success
+                    // console.log(`[${parentId}] Successfully created record ${index + 1} (ID: ${res.id})`);
                 }
             });
         } else {
-             console.log(`${logPrefix} No new records to create in this batch.`);
+            console.log(`[${parentId}] No new ${summaryCategory} records to create.`);
         }
 
-        // Bulk Update
         if (recordsToUpdate.length > 0) {
-            console.log(`${logPrefix} Updating ${recordsToUpdate.length} existing records via bulk API...`);
+            console.log(`[${parentId}] Updating ${recordsToUpdate.length} existing ${summaryCategory} summary records via bulk API...`);
              const updateResults = await conn.bulk.load(TIMELINE_SUMMARY_OBJECT_API_NAME, "update", options, recordsToUpdate);
-             console.log(`${logPrefix} Bulk update results received (${updateResults.length}).`);
+             console.log(`[${parentId}] Bulk update results received (${updateResults.length}).`);
              updateResults.forEach((res, index) => {
                  if (!res.success) {
-                    console.error(`${logPrefix} Error updating record ${index + 1} (ID: ${recordsToUpdate[index].Id}):`, JSON.stringify(res.errors));
+                    console.error(`[${parentId}] Error updating record ${index + 1} (ID: ${recordsToUpdate[index].Id}):`, res.errors);
+                 } else {
+                     // Optional: Log success
+                     // console.log(`[${parentId}] Successfully updated record ${index + 1} (ID: ${res.id})`);
                  }
              });
         } else {
-             console.log(`${logPrefix} No existing records to update in this batch.`);
+            console.log(`[${parentId}] No existing ${summaryCategory} records to update.`);
         }
     } catch (err) {
-        console.error(`${logPrefix} Failed to save records to Salesforce using Bulk API: ${err.message}`, err.stack);
-        throw new Error(`Salesforce save operation failed: ${err.message}`); // Propagate error
+        console.error(`[${parentId}] Failed to save ${summaryCategory} records to Salesforce using Bulk API: ${err.message}`, err);
+        // Throw error to be caught by processSummary and trigger failure callback
+        throw new Error(`Salesforce save operation failed: ${err.message}`);
     }
+}
+
+
+// --- Salesforce Data Fetching with Pagination ---
+async function fetchRecords(conn, queryOrUrl, allRecords = [], isFirstIteration = true) {
+    try {
+        console.log(`QUERY : ${queryOrUrl}. `);
+        const logPrefix = isFirstIteration ? "Initial query" : "Querying more records from";
+        // Avoid logging potentially sensitive parts of the URL/query
+        console.log(`${logPrefix}: ${typeof queryOrUrl === 'string' && queryOrUrl.startsWith('SELECT') ? queryOrUrl.substring(0, 150) + '...' : 'nextRecordsUrl'}`);
+
+        // Use query() for initial SOQL, queryMore() for subsequent nextRecordsUrl
+        const queryResult = isFirstIteration
+            ? await conn.query(queryOrUrl)
+            : await conn.queryMore(queryOrUrl); // queryOrUrl here is nextRecordsUrl
+
+        const fetchedCount = queryResult.records ? queryResult.records.length : 0;
+        console.log(`Fetched 1000 more records. Done: ${queryResult.done}`);
+
+        if (fetchedCount > 0) {
+            allRecords = allRecords.concat(queryResult.records);
+        }
+
+        // Check if more records exist and a URL is provided
+        if (!queryResult.done && queryResult.nextRecordsUrl) {
+            // Recursively fetch the next batch
+            return fetchRecords(conn, queryResult.nextRecordsUrl, allRecords, false);
+        } else {
+            // All records fetched, proceed to grouping
+            console.log(`Finished fetching. Total records retrieved: ${allRecords.length}. Grouping...`);
+            return groupRecordsByMonthYear(allRecords); // Group after all records are fetched
+        }
+    } catch (error) {
+        console.error(`Error fetching Salesforce activities: ${error.message}`, error);
+        throw error; // Re-throw to be handled by the caller (processSummary)
+    }
+}
+
+
+// --- Data Grouping Helper Function ---
+function groupRecordsByMonthYear(records) {
+    const groupedData = {}; // { year: [ { MonthName: [activityObj, ...] }, ... ], ... }
+    records.forEach(activity => {
+        // Validate essential ActivityDate field
+        if (!activity.ActivityDate) {
+            console.warn(`Skipping activity (ID: ${activity.Id || 'Unknown'}) due to missing ActivityDate.`);
+            return; // Skip record if date is missing
+        }
+        try {
+            const date = new Date(activity.ActivityDate);
+            // Check for invalid date object
+             if (isNaN(date.getTime())) {
+                 console.warn(`Skipping activity (ID: ${activity.Id || 'Unknown'}) due to invalid ActivityDate format: ${activity.ActivityDate}`);
+                 return;
+             }
+
+            // Use UTC methods to avoid timezone interpretation issues during grouping
+            const year = date.getUTCFullYear(); // Use UTC to avoid timezone issues
+            const month = date.toLocaleString('en-US', { month: 'long', timeZone: 'UTC' }); // Get month name in UTC
+
+            // Initialize year array if it doesn't exist
+            if (!groupedData[year]) {
+                groupedData[year] = [];
+            }
+
+            // Find or create the object for the specific month within the year's array
+            let monthEntry = groupedData[year].find(entry => entry[month]);
+            if (!monthEntry) {
+                monthEntry = { [month]: [] };
+                groupedData[year].push(monthEntry);
+            }
+
+            // Add the relevant activity details to the month's array
+            // Select only necessary fields to reduce memory usage
+            monthEntry[month].push({
+                Id: activity.Id,
+                Description: activity.Description || "No Description",
+                Subject: activity.Subject || "No Subject",
+                ActivityDate: activity.ActivityDate // Keep original format if needed
+                // Add other fields from the query if required by the AI prompt/function
+            });
+        } catch(dateError) {
+             // Catch potential errors during date processing
+             console.warn(`Skipping activity (ID: ${activity.Id || 'Unknown'}) due to date processing error: ${dateError.message}. Date value: ${activity.ActivityDate}`);
+        }
+    });
+    console.log("Finished grouping records by year and month.");
+    return groupedData;
 }
 
 
 // --- Callback Sending Function ---
-// Sends the final status notification back to the specified callback URL
 async function sendCallbackResponse(accountId, callbackUrl, loggedinUserId, accessToken, status, message) {
-    const logPrefix = `[Callback ${accountId}]`;
-    // Truncate message for logging only
-    const logMessage = message.length > 300 ? message.substring(0, 300) + '...' : message;
-    console.log(`${logPrefix} Sending callback to ${callbackUrl}. Status: ${status}, Message snippet: ${logMessage}`);
+    // Truncate long messages for logging
+    const logMessage = message.length > 200 ? message.substring(0, 200) + '...' : message;
+    console.log(`[${accountId}] Sending callback to ${callbackUrl}. Status: ${status}, Message: ${logMessage}`);
     try {
         await axios.post(callbackUrl,
             {
+                // Payload structure expected by the callback receiver
                 accountId: accountId,
                 loggedinUserId: loggedinUserId,
-                status: "Completed", // Status of the callback action itself
-                processResult: status, // Overall process result ('Success', 'Failed', 'Partial Success')
-                message: message // Full message/error list
+                status: "Completed", // Status of the *callback sending action* itself
+                processResult: status, // Overall result ('Success' or 'Failed') of the summary generation
+                message: message // Detailed message or error
             },
             {
                 headers: {
                     "Content-Type": "application/json",
-                    "Authorization": `Bearer ${accessToken}` // Authenticate callback if needed
+                    // Use the provided access token for authenticating the callback request
+                    "Authorization": `Bearer ${accessToken}`
                 },
-                timeout: 30000 // 30 second timeout for the callback request
+                timeout: 20000 // Set a reasonable timeout (e.g., 20 seconds)
             }
         );
-        console.log(`${logPrefix} Callback sent successfully.`);
+        console.log(`[${accountId}] Callback sent successfully.`);
     } catch (error) {
-        // Log detailed callback sending errors
         let errorMessage = error.message;
         if (error.response) {
-            errorMessage = `Callback failed - Status: ${error.response.status}, Data: ${JSON.stringify(error.response.data)}, Msg: ${error.message}`;
+            // Include response details if available (status code, data)
+            errorMessage = `Status: ${error.response.status}, Data: ${JSON.stringify(error.response.data)}, Message: ${error.message}`;
         } else if (error.request) {
-            errorMessage = `Callback failed - No response received. ${error.message}`;
-        } else {
-            errorMessage = `Callback failed - Error setting up request: ${error.message}`;
+            errorMessage = `No response received from callback URL. ${error.message}`;
         }
-        console.error(`${logPrefix} Failed to send callback: ${errorMessage}`);
-        // Note: No retry logic implemented here by default
+        console.error(`[${accountId}] Failed to send callback to ${callbackUrl}: ${errorMessage}`);
+        // Depending on requirements, you might implement retry logic here or log for manual follow-up
     }
 }
+
 
 // --- Utility Helper Functions ---
 
-// Finds a value in the summaryRecordsMap array [{key:k, value:v}, ...]
+// Finds a value in an array of {key: ..., value: ...} objects
 function getValueByKey(recordsArray, searchKey) {
-    if (!recordsArray || !Array.isArray(recordsArray) || !searchKey) return null;
-    // Use case-insensitive search for robustness
-    const keyLower = searchKey.toLowerCase();
-    const record = recordsArray.find(item => item && typeof item.key === 'string' && item.key.toLowerCase() === keyLower);
-    return record ? record.value : null;
+    if (!recordsArray || !Array.isArray(recordsArray)) return null;
+    const record = recordsArray.find(item => item && item.key === searchKey);
+    return record ? record.value : null; // Return the value or null if not found
 }
 
-// Transforms the raw quarterly AI output into the structure needed for Salesforce saving
+// Transforms the AI's quarterly output structure (for a single quarter)
+// to the format needed for Salesforce saving.
 function transformQuarterlyStructure(quarterlyAiOutput) {
-    const result = {}; // Target: { year: { QX: { summaryDetails, summaryJson, count, startdate } } }
-
-    // Validate the expected structure from the AI
-    if (!quarterlyAiOutput?.yearlySummary?.[0]?.year ||
-        !quarterlyAiOutput.yearlySummary[0]?.quarters?.[0]?.quarter ||
-        !quarterlyAiOutput.yearlySummary[0]?.quarters?.[0]?.summary ||
-        quarterlyAiOutput.yearlySummary[0]?.quarters?.[0]?.activityCount === undefined ||
-        !quarterlyAiOutput.yearlySummary[0]?.quarters?.[0]?.startdate
-       ) {
-        console.warn("[Transform Quarterly] Invalid or incomplete structure received from quarterly AI:", JSON.stringify(quarterlyAiOutput).substring(0, 500));
-        return result; // Return empty if validation fails
+    const result = {}; // { year: { QX: { summaryDetails, summaryJson, count, startdate } } }
+    // Basic validation of the input structure from the AI
+    if (!quarterlyAiOutput || !Array.isArray(quarterlyAiOutput.yearlySummary) || quarterlyAiOutput.yearlySummary.length === 0) {
+        console.warn("Invalid or empty structure received from quarterly AI transform function:", quarterlyAiOutput);
+        return result; // Return empty object if structure is wrong
     }
 
-    try {
-        // Safely access nested data after validation
-        const yearData = quarterlyAiOutput.yearlySummary[0];
-        const year = yearData.year;
-        result[year] = {};
-
-        const quarterData = yearData.quarters[0];
-        const quarter = quarterData.quarter;
-
-        // Extract data for the Salesforce record fields
-        const htmlSummary = quarterData.summary;
-        const fullQuarterlyJson = JSON.stringify(quarterlyAiOutput); // Store the whole AI response
-        const activityCount = quarterData.activityCount;
-        const startDate = quarterData.startdate; // Expect YYYY-MM-DD
-
-        // Assign to the result structure
-        result[year][quarter] = {
-            summaryDetails: htmlSummary,
-            summaryJson: fullQuarterlyJson,
-            count: activityCount,
-            startdate: startDate
-        };
-
-    } catch (transformError) {
-        console.error("[Transform Quarterly] Error during transformation:", transformError.stack);
-        console.error("[Transform Quarterly] AI Output causing error (truncated):", JSON.stringify(quarterlyAiOutput).substring(0, 500));
-        return {}; // Return empty on error
+    // Process the first year entry (quarterly AI should only return one year/quarter per call)
+    const yearData = quarterlyAiOutput.yearlySummary[0];
+    if (!yearData || !yearData.year || !Array.isArray(yearData.quarters) || yearData.quarters.length === 0) {
+        console.warn(`Invalid year or missing quarters data in quarterly AI output passed to transform:`, yearData);
+        return result;
     }
 
-    return result; // Return the structured data: e.g., { 2023: { Q1: { ... } } }
+    const year = yearData.year;
+    result[year] = {}; // Initialize year object
+
+    // Process the first quarter entry within that year (should only be one)
+    const quarterData = yearData.quarters[0];
+    if (!quarterData || !quarterData.quarter || !quarterData.summary) {
+         console.warn(`Invalid quarter data in quarterly AI output passed to transform for year ${year}:`, quarterData);
+         // Return the result potentially with just the empty year object if quarter is invalid
+         return result;
+    }
+
+    // Extract the main HTML summary intended for display
+    const htmlSummary = quarterData.summary || '';
+    // Stringify the entire quarterData object to store the full AI response context
+    const fullQuarterlyJson = JSON.stringify(quarterData);
+    // Get activity count, defaulting to 0 if missing
+    const activityCount = quarterData.activityCount || 0;
+     // Get start date, calculating a default if missing
+    const startDate = quarterData.startdate || `${year}-${getQuarterStartMonth(quarterData.quarter)}-01`;
+
+
+    // Structure the data for the createTimileSummarySalesforceRecords function
+    result[year][quarterData.quarter] = {
+        summaryDetails: htmlSummary, // The extracted HTML summary
+        summaryJson: fullQuarterlyJson, // The full JSON string of the quarter's data from AI
+        count: activityCount, // Use a consistent 'count' key
+        startdate: startDate // Use a consistent 'startdate' key
+    };
+
+    // Return structure like { 2023: { Q1: { ...data... } } }
+    return result;
 }
 
-// =============================================================================
-//                             End of Code
-// =============================================================================
+// Helper to get the starting month number (01, 04, 07, 10) for a quarter string ('Q1'-'Q4')
+function getQuarterStartMonth(quarter) {
+    switch (String(quarter).toUpperCase()) { // Ensure comparison is case-insensitive
+        case 'Q1': return '01';
+        case 'Q2': return '04';
+        case 'Q3': return '07';
+        case 'Q4': return '10';
+        default:
+            console.warn(`Invalid quarter identifier "${quarter}" provided to getQuarterStartMonth. Defaulting to Q1 start month.`);
+            return '01'; // Fallback to '01' for safety
+    }
+}
