@@ -670,7 +670,7 @@ async function generateSummary(
                 // Create a temporary local file (.txt extension)
                 const timestamp = new Date().toISOString().replace(/[:.-]/g, "_");
                 // *** USE .txt EXTENSION ***
-                const filename = `salesforce_activities_${timestamp}_${thread.id}.txt`;
+                const filename = `salesforce_activities_${timestamp}_${thread.id}.json`;
                 filePath = path.join(__dirname, filename); // Or TEMP_FILE_DIR
                 await fs.ensureDir(path.dirname(filePath)); // Ensure directory exists
 
@@ -1069,9 +1069,9 @@ async function createTimileSummarySalesforceRecords(conn, summaries, parentId, s
 // --- Salesforce Data Fetching with Pagination ---
 async function fetchRecords(conn, queryOrUrl, allRecords = [], isFirstIteration = true) {
     try {
-        const logPrefix = isFirstIteration ? "Initial query" : "Querying more records from";
+        //const logPrefix = isFirstIteration ? "Initial query" : "Querying more records from";
         // Avoid logging potentially sensitive parts of the URL/query
-        console.log(`${logPrefix}: ${typeof queryOrUrl === 'string' && queryOrUrl.startsWith('SELECT') ? queryOrUrl.substring(0, 150) + '...' : 'nextRecordsUrl'}`);
+        //console.log(`${logPrefix}: ${typeof queryOrUrl === 'string' && queryOrUrl.startsWith('SELECT') ? queryOrUrl.substring(0, 150) + '...' : 'nextRecordsUrl'}`);
 
         // Use query() for initial SOQL, queryMore() for subsequent nextRecordsUrl
         const queryResult = isFirstIteration
@@ -1079,11 +1079,11 @@ async function fetchRecords(conn, queryOrUrl, allRecords = [], isFirstIteration 
             : await conn.queryMore(queryOrUrl); // queryOrUrl here is nextRecordsUrl
 
         const fetchedCount = queryResult.records ? queryResult.records.length : 0;
-        console.log(`Fetched ${fetchedCount} records. Total so far: ${allRecords.length + fetchedCount}. Done: ${queryResult.done}`);
+        //console.log(`Fetched ${fetchedCount} records. Total so far: ${allRecords.length + fetchedCount}. Done: ${queryResult.done}`);
 
-        if (fetchedCount > 0) {
-            allRecords = allRecords.concat(queryResult.records);
-        }
+        // if (fetchedCount > 0) {
+        //     allRecords = allRecords.concat(queryResult.records);
+        // }
 
         // Check if more records exist and a URL is provided
         if (!queryResult.done && queryResult.nextRecordsUrl) {
