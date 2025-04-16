@@ -332,14 +332,10 @@ async function createOrRetrieveAssistant(
 
         // Define base tool configuration needed for assistants
         // These enable the *capabilities*. The specific function *schema* is passed during the run.
-        
-
-        let monthlyFuncSchema = defaultFunctions.find(f => f.name === 'generate_monthly_activity_summary');
-        let quarterlyFuncSchema = defaultFunctions.find(f => f.name === 'generate_quarterly_activity_summary');
-
-        const assistantToolsMonthly = [{ type: "file_search" }, { type: "function", "function": monthlyFuncSchema }];
-        const assistantToolsQuarterly = [{ type: "file_search" }, { type: "function", "function": quarterlyFuncSchema }];
-
+        const assistantBaseTools = [
+             { type: "file_search" }, // Enable file searching capability
+             { type: "function" }     // Enable function calling capability
+        ];
 
         // --- Setup Monthly Assistant ---
         monthlyAssistantId = await createOrRetrieveAssistant(
@@ -347,7 +343,7 @@ async function createOrRetrieveAssistant(
             OPENAI_MONTHLY_ASSISTANT_ID_ENV,
             "Salesforce Monthly Summarizer",
             "You are an AI assistant specialized in analyzing raw Salesforce activity data for a single month and generating structured JSON summaries using the provided function 'generate_monthly_activity_summary'. Apply sub-theme segmentation within the activityMapping as described in the function schema. Focus on extracting key themes, tone, and recommended actions. Use file_search if data is provided as a file.",
-            assistantToolsMonthly, // Pass base tool config
+            assistantBaseTools, // Pass base tool config
             OPENAI_MODEL
         );
 
@@ -357,7 +353,7 @@ async function createOrRetrieveAssistant(
             OPENAI_QUARTERLY_ASSISTANT_ID_ENV,
             "Salesforce Quarterly Summarizer", // Corrected name
             "You are an AI assistant specialized in aggregating pre-summarized monthly Salesforce activity data (provided as JSON in the prompt) into a structured quarterly JSON summary for a specific quarter using the provided function 'generate_quarterly_activity_summary'. Consolidate insights and activity lists accurately based on the input monthly summaries.",
-            assistantToolsQuarterly, // Pass base tool config
+             assistantBaseTools, // Pass base tool config
              OPENAI_MODEL
         );
 
@@ -919,8 +915,8 @@ async function createTimileSummarySalesforceRecords(conn, summaries, parentId, s
             // !!! CRITICAL: Verify these API names match your Salesforce object !!!
             const recordPayload = {
                 // Use one Parent Id field - typically a direct lookup is better if always linking to Account
-                // Parent_Id__c: parentId, // Generic parent field (if used)
-                Account__c: parentId, // Direct lookup to Account (RECOMMENDED if always Account)
+                Parent_Id__c: parentId, // Generic parent field (if used)
+                //Account__c: parentId, // Direct lookup to Account (RECOMMENDED if always Account)
                 Month__c: monthValue || null, // Text field for month name (null if quarterly)
                 Year__c: String(year), // Text or Number field for year
                 Summary_Category__c: summaryCategory, // Picklist ('Monthly', 'Quarterly')
