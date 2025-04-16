@@ -337,8 +337,8 @@ async function createOrRetrieveAssistant(
         let monthlyFuncSchema = defaultFunctions.find(f => f.name === 'generate_monthly_activity_summary');
         let quarterlyFuncSchema = defaultFunctions.find(f => f.name === 'generate_quarterly_activity_summary');
 
-        const assistantToolsMonthly = [{ type: "file_search" }, { type: "function", "function": monthlyFuncSchema }],
-        const assistantToolsQuarterly = [{ type: "file_search" }, { type: "function", "function": quarterlyFuncSchema }],
+        const assistantToolsMonthly = [{ type: "file_search" }, { type: "function", "function": monthlyFuncSchema }];
+        const assistantToolsQuarterly = [{ type: "file_search" }, { type: "function", "function": quarterlyFuncSchema }];
 
 
         // --- Setup Monthly Assistant ---
