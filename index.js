@@ -930,8 +930,8 @@ async function createTimileSummarySalesforceRecords(conn, summaries, parentId, s
             };
 
              // Basic validation before adding
-             if (!recordPayload.Account__c || !recordPayload.Summary_Category__c || !recordPayload.Month_Date__c) {
-                 console.warn(`[${parentId}] Skipping record for ${summaryMapKey} due to missing Account ID, Category, or Start Date.`);
+             if (!recordPayload.Summary_Category__c || !recordPayload.Month_Date__c) {
+                 console.warn(`[${parentId}] Skipping record for ${summaryMapKey} due to missing Category, or Start Date.`);
                  continue;
              }
 
