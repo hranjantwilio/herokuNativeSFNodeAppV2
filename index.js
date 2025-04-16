@@ -332,10 +332,14 @@ async function createOrRetrieveAssistant(
 
         // Define base tool configuration needed for assistants
         // These enable the *capabilities*. The specific function *schema* is passed during the run.
-        const assistantBaseTools = [
-             { type: "file_search" }, // Enable file searching capability
-             { type: "function" }     // Enable function calling capability
-        ];
+        
+
+        let monthlyFuncSchema = defaultFunctions.find(f => f.name === 'generate_monthly_activity_summary');
+        let quarterlyFuncSchema = defaultFunctions.find(f => f.name === 'generate_quarterly_activity_summary');
+
+        const assistantToolsMonthly = [{ type: "file_search" }, { type: "function", "function": monthlyFuncSchema }],
+        const assistantToolsQuarterly = [{ type: "file_search" }, { type: "function", "function": quarterlyFuncSchema }],
+
 
         // --- Setup Monthly Assistant ---
         monthlyAssistantId = await createOrRetrieveAssistant(
@@ -343,7 +347,7 @@ async function createOrRetrieveAssistant(
             OPENAI_MONTHLY_ASSISTANT_ID_ENV,
             "Salesforce Monthly Summarizer",
             "You are an AI assistant specialized in analyzing raw Salesforce activity data for a single month and generating structured JSON summaries using the provided function 'generate_monthly_activity_summary'. Apply sub-theme segmentation within the activityMapping as described in the function schema. Focus on extracting key themes, tone, and recommended actions. Use file_search if data is provided as a file.",
-            assistantBaseTools, // Pass base tool config
+            assistantToolsMonthly, // Pass base tool config
             OPENAI_MODEL
         );
 
@@ -353,7 +357,7 @@ async function createOrRetrieveAssistant(
             OPENAI_QUARTERLY_ASSISTANT_ID_ENV,
             "Salesforce Quarterly Summarizer", // Corrected name
             "You are an AI assistant specialized in aggregating pre-summarized monthly Salesforce activity data (provided as JSON in the prompt) into a structured quarterly JSON summary for a specific quarter using the provided function 'generate_quarterly_activity_summary'. Consolidate insights and activity lists accurately based on the input monthly summaries.",
-             assistantBaseTools, // Pass base tool config
+            assistantToolsQuarterly, // Pass base tool config
              OPENAI_MODEL
         );
 
