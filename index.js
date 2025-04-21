@@ -414,7 +414,7 @@ app.post('/generatesummary', async (req, res) => {
     } = req.body;
 
     if (!accountId || !callbackUrl || !accessToken || !queryText || !userPrompt || !userPromptQtr || !loggedinUserId) {
-        console.warn("Bad Request: Missing required parameters. accessToken : " + accessToken + " loggedinUserId : "+ loggedinUserId);
+        console.warn("Bad Request: Missing required parameters. accessToken : " + accessToken + " loggedinUserId : "+ loggedinUserId + " accountId : " + accountId + " callbackUrl : " + callbackUrl + " queryText : " + queryText + " userPrompt : " + userPrompt + " userPromptQtr : " + userPromptQtr);
         return res.status(400).send({ error: "Missing required parameters (accountId, callbackUrl, accessToken, queryText, userPrompt, userPromptQtr, loggedinUserId)" });
     }
 
