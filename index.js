@@ -594,7 +594,7 @@ async function processSummary(
 
         if (Object.keys(monthlyForSalesforce).length > 0 && Object.values(monthlyForSalesforce).some(year => Object.keys(year).length > 0)) {
             console.log(`[${accountId}] Saving monthly summaries to Salesforce...`);
-            await createTimileSummarySalesforceRecords(conn, monthlyForSalesforce, accountId, 'Monthly', summaryRecordsMap);
+            await createTimileSummarySalesforceRecords(conn, monthlyForSalesforce, accountId, 'Monthly', summaryRecordsMap,loggedinUserId);
             console.log(`[${accountId}] Monthly summaries saved.`);
         } else {
              console.log(`[${accountId}] No monthly summaries generated to save.`);
@@ -676,7 +676,7 @@ async function processSummary(
          if (Object.keys(finalQuarterlyDataForSalesforce).length > 0 && Object.values(finalQuarterlyDataForSalesforce).some(year => Object.keys(year).length > 0)) {
             const totalQuarterlyRecords = Object.values(finalQuarterlyDataForSalesforce).reduce((sum, year) => sum + Object.keys(year).length, 0);
             console.log(`[${accountId}] Saving ${totalQuarterlyRecords} quarterly summaries to Salesforce...`);
-            await createTimileSummarySalesforceRecords(conn, finalQuarterlyDataForSalesforce, accountId, 'Quarterly', summaryRecordsMap);
+            await createTimileSummarySalesforceRecords(conn, finalQuarterlyDataForSalesforce, accountId, 'Quarterly', summaryRecordsMap,loggedinUserId);
             console.log(`[${accountId}] Quarterly summaries saved.`);
         } else {
              console.log(`[${accountId}] No quarterly summaries generated or transformed to save.`);
@@ -875,7 +875,7 @@ async function generateSummary(
 
 // --- Salesforce Record Creation/Update Function ---
 // Uses Bulk API for efficiency
-async function createTimileSummarySalesforceRecords(conn, summaries, parentId, summaryCategory, summaryRecordsMap) {
+async function createTimileSummarySalesforceRecords(conn, summaries, parentId, summaryCategory, summaryRecordsMap,loggedinUserId) {
     console.log(`[${parentId}] Preparing to save ${summaryCategory} summaries...`);
     let recordsToCreate = [];
     let recordsToUpdate = [];
@@ -919,7 +919,8 @@ async function createTimileSummarySalesforceRecords(conn, summaries, parentId, s
                 //Account__c: parentId, // Direct lookup to Account (RECOMMENDED if always Account)
                 Month__c: monthValue || null, // Text field for month name (null if quarterly)
                 Year__c: String(year), // Text or Number field for year
-                Summary_Category__c: summaryCategory, // Picklist ('Monthly', 'Quarterly')
+                Summary_Category__c: summaryCategory,
+                Requested_By__c: loggedinUserId, // Picklist ('Monthly', 'Quarterly')
                 Summary__c: summaryJsonString ? summaryJsonString.substring(0, 131072) : null, // Long Text Area (check SF limit)
                 Summary_Details__c: summaryDetailsHtml ? summaryDetailsHtml.substring(0, 131072) : null, // Rich Text Area (check SF limit)
                 FY_Quarter__c: fyQuarterValue || null, // Text field for quarter (e.g., 'Q1') (null if monthly)
