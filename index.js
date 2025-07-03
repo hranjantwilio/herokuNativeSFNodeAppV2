@@ -88,10 +88,10 @@ const defaultFunctions = [
                         "type": "object",
                         "properties": {
                           "Id": { "type": "string", "description": "Salesforce Id of the specific activity" },
-                          "LinkText": { "type": "string", "description": "'MMM DD YYYY: Short Description (max 50 chars)' - Generate from ActivityDate, Subject, Description." },
-                          "ActivityDate": { "type": "string", "description": "Activity Date in 'YYYY-MM-DD' format. Must belong to the summarized month/year." }
+                          "LinkText": { "type": "string", "description": "'MMM DD YYYY: Short Description (max 50 chars)' - Generate from CreatedDate, Subject, Description." },
+                          "CreatedDate": { "type": "string", "description": "CreatedDate in 'YYYY-MM-DD' format. Must belong to the summarized month/year." }
                         },
-                        "required": ["Id", "LinkText", "ActivityDate"],
+                        "required": ["Id", "LinkText", "CreatedDate"],
                         "additionalProperties": false
                       }
                     }
@@ -115,10 +115,10 @@ const defaultFunctions = [
                           "type": "object",
                           "properties": {
                             "Id": { "type": "string", "description": "Salesforce Id of the specific activity" },
-                            "LinkText": { "type": "string", "description": "'MMM DD YYYY: Short Description (max 50 chars)' - Generate from ActivityDate, Subject, Description." },
-                            "ActivityDate": { "type": "string", "description": "Activity Date in 'YYYY-MM-DD' format. Must belong to the summarized month/year." }
+                            "LinkText": { "type": "string", "description": "'MMM DD YYYY: Short Description (max 50 chars)' - Generate from CreatedDate, Subject, Description." },
+                            "CreatedDate": { "type": "string", "description": "CreatedDate in 'YYYY-MM-DD' format. Must belong to the summarized month/year." }
                           },
-                          "required": ["Id", "LinkText", "ActivityDate"],
+                          "required": ["Id", "LinkText", "CreatedDate"],
                           "additionalProperties": false
                         }
                       }
@@ -141,10 +141,10 @@ const defaultFunctions = [
                           "type": "object",
                           "properties": {
                             "Id": { "type": "string", "description": "Salesforce Id of the specific activity" },
-                            "LinkText": { "type": "string", "description": "'MMM DD YYYY: Short Description (max 50 chars)' - Generate from ActivityDate, Subject, Description." },
-                            "ActivityDate": { "type": "string", "description": "Activity Date in 'YYYY-MM-DD' format. Must belong to the summarized month/year." }
+                            "LinkText": { "type": "string", "description": "'MMM DD YYYY: Short Description (max 50 chars)' - Generate from CreatedDate, Subject, Description." },
+                            "CreatedDate": { "type": "string", "description": "CreatedDate in 'YYYY-MM-DD' format. Must belong to the summarized month/year." }
                           },
-                          "required": ["Id", "LinkText", "ActivityDate"],
+                          "required": ["Id", "LinkText", "CreatedDate"],
                           "additionalProperties": false
                         }
                       }
@@ -216,9 +216,9 @@ const defaultFunctions = [
                                 "properties": {
                                   "id": { "type": "string", "description": "Salesforce Activity ID (copied from monthly input)." },
                                   "linkText": { "type": "string", "description": "'MMM DD YYYY: Short Description' (copied from monthly input)." },
-                                  "ActivityDate": { "type": "string", "description": "Activity Date in 'YYYY-MM-DD' format (copied from monthly input)." }
+                                  "CreatedDate": { "type": "string", "description": "CreatedDate in 'YYYY-MM-DD' format (copied from monthly input)." }
                                 },
-                                "required": ["id", "linkText", "ActivityDate"],
+                                "required": ["id", "linkText", "CreatedDate"],
                                 "additionalProperties": false
                               }
                             }
@@ -409,6 +409,7 @@ app.post('/generatesummary', async (req, res) => {
         queryText, // SOQL query to fetch activities
         summaryMap, // Optional JSON string map of existing summary records (e.g., {"Jan 2024": "recordId"})
         loggedinUserId,
+        sendCallback,
         qtrJSON, // Optional override for quarterly function schema (JSON string)
         monthJSON // Optional override for monthly function schema (JSON string)
     } = req.body;
@@ -478,7 +479,8 @@ app.post('/generatesummary', async (req, res) => {
         monthlyFuncSchema, // Pass the final schema (default or custom)
         quarterlyFuncSchema, // Pass the final schema (default or custom)
         monthlyAssistantId, // Pass the ID obtained during startup
-        quarterlyAssistantId // Pass the ID obtained during startup
+        quarterlyAssistantId, // Pass the ID obtained during startup
+        sendCallback
     ).catch(async (error) => {
         console.error(`[${accountId}] Unhandled error during background processing:`, error);
         try {
@@ -513,7 +515,8 @@ async function processSummary(
     finalMonthlyFuncSchema, // Receive the final schema to use
     finalQuarterlyFuncSchema, // Receive the final schema to use
     finalMonthlyAssistantId, // Receive the final ID
-    finalQuarterlyAssistantId // Receive the final ID
+    finalQuarterlyAssistantId, // Receive the final ID
+    sendCallback
 ) {
     console.log(`[${accountId}] Starting processSummary using Monthly Asst: ${finalMonthlyAssistantId}, Quarterly Asst: ${finalQuarterlyAssistantId}`);
 
@@ -686,7 +689,11 @@ async function processSummary(
         // 8. Send Success Callback
         // TODO: Enhance status message for partial failures if needed.
         console.log(`[${accountId}] Process completed.`);
-        await sendCallbackResponse(accountId, callbackUrl, loggedinUserId, accessToken, "Success", "Summary Processed Successfully");
+        console.log(`sendCallback Before sendCallbackResponse is [${sendCallback}]`);
+        if(sendCallback == 'Yes') {
+            console.log(`Inside sendCallbackResponse success if block, value is [${sendCallback}]`);
+            await sendCallbackResponse(accountId, callbackUrl, loggedinUserId, accessToken, "Success", "Summary Processed Successfully");
+        }
 
     } catch (error) {
         console.error(`[${accountId}] Error during summary processing:`, error);
@@ -921,6 +928,7 @@ async function createTimileSummarySalesforceRecords(conn, summaries, parentId, s
                 Year__c: String(year), // Text or Number field for year
                 Summary_Category__c: summaryCategory,
                 Requested_By__c: loggedinUserId, // Picklist ('Monthly', 'Quarterly')
+                Type__c: 'Activity',
                 Summary__c: summaryJsonString ? summaryJsonString.substring(0, 131072) : null, // Long Text Area (check SF limit)
                 Summary_Details__c: summaryDetailsHtml ? summaryDetailsHtml.substring(0, 131072) : null, // Rich Text Area (check SF limit)
                 FY_Quarter__c: fyQuarterValue || null, // Text field for quarter (e.g., 'Q1') (null if monthly)
@@ -952,17 +960,19 @@ async function createTimileSummarySalesforceRecords(conn, summaries, parentId, s
         const options = { allOrNone: false }; // Process records independently, allow partial success
 
         if (recordsToCreate.length > 0) {
-            console.log(`[${parentId}] Creating ${recordsToCreate.length} new ${summaryCategory} summary records via bulk API...`);
-            const createResults = await conn.bulk.load(TIMELINE_SUMMARY_OBJECT_API_NAME, "insert", options, recordsToCreate);
-            handleBulkResults(createResults, recordsToCreate, 'create', parentId);
+            console.log(`[${parentId}] Creating ${recordsToCreate.length} new ${summaryCategory} summary records...`);
+            //const createResults = await conn.bulk.load(TIMELINE_SUMMARY_OBJECT_API_NAME, "insert", options, recordsToCreate);
+            const createResults = await conn.sobject(TIMELINE_SUMMARY_OBJECT_API_NAME).create(recordsToCreate);
+            //handleBulkResults(createResults, recordsToCreate, 'create', parentId);
         } else {
             console.log(`[${parentId}] No new ${summaryCategory} records to create.`);
         }
 
         if (recordsToUpdate.length > 0) {
-            console.log(`[${parentId}] Updating ${recordsToUpdate.length} existing ${summaryCategory} summary records via bulk API...`);
-             const updateResults = await conn.bulk.load(TIMELINE_SUMMARY_OBJECT_API_NAME, "update", options, recordsToUpdate);
-             handleBulkResults(updateResults, recordsToUpdate, 'update', parentId);
+            console.log(`[${parentId}] Updating ${recordsToUpdate.length} existing ${summaryCategory} summary records...`);
+             //const updateResults = await conn.bulk.load(TIMELINE_SUMMARY_OBJECT_API_NAME, "update", options, recordsToUpdate);
+            const updateResults = await conn.sobject(TIMELINE_SUMMARY_OBJECT_API_NAME).update(recordsToUpdate);
+             //handleBulkResults(updateResults, recordsToUpdate, 'update', parentId);
         } else {
             console.log(`[${parentId}] No existing ${summaryCategory} records to update.`);
         }
@@ -1041,16 +1051,16 @@ function groupRecordsByMonthYear(records) {
     const monthNames = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
 
     records.forEach(activity => {
-        // Validate essential ActivityDate field
-        if (!activity.ActivityDate) {
-            console.warn(`Skipping activity (ID: ${activity.Id || 'Unknown'}) due to missing ActivityDate.`);
+        // Validate essential CreatedDate field
+        if (!activity.CreatedDate) {
+            console.warn(`Skipping activity (ID: ${activity.Id || 'Unknown'}) due to missing CreatedDate.`);
             return; // Skip record if date is missing
         }
         try {
             // Attempt to parse the date. Handle potential invalid date strings.
-            const date = new Date(activity.ActivityDate);
+            const date = new Date(activity.CreatedDate);
              if (isNaN(date.getTime())) {
-                 console.warn(`Skipping activity (ID: ${activity.Id || 'Unknown'}) due to invalid ActivityDate format: ${activity.ActivityDate}`);
+                 console.warn(`Skipping activity (ID: ${activity.Id || 'Unknown'}) due to invalid CreatedDate format: ${activity.CreatedDate}`);
                  return;
              }
 
@@ -1077,13 +1087,13 @@ function groupRecordsByMonthYear(records) {
                 Id: activity.Id,
                 Description: activity.Description || null, // Use null for missing values if preferred
                 Subject: activity.Subject || null,
-                ActivityDate: activity.ActivityDate // Keep original format if needed elsewhere
+                CreatedDate: activity.CreatedDate // Keep original format if needed elsewhere
                 // Add other fields from the SOQL query if required by the AI prompt/function schemas
                 // e.g., Type: activity.Type, Status: activity.Status
             });
         } catch(dateError) {
              // Catch potential errors during date processing (though basic validation is done above)
-             console.warn(`Skipping activity (ID: ${activity.Id || 'Unknown'}) due to date processing error: ${dateError.message}. Date value: ${activity.ActivityDate}`);
+             console.warn(`Skipping activity (ID: ${activity.Id || 'Unknown'}) due to date processing error: ${dateError.message}. Date value: ${activity.Createddate}`);
         }
     });
     console.log("Finished grouping records by year and month.");
@@ -1095,6 +1105,7 @@ function groupRecordsByMonthYear(records) {
 // Sends the final status back to the specified Salesforce URL
 async function sendCallbackResponse(accountId, callbackUrl, loggedinUserId, accessToken, status, message) {
     // Truncate long messages for logging clarity
+    console.log(`Inside sendCallbackResponse method block, sending to sfdc`);
     const logMessage = message.length > 500 ? message.substring(0, 500) + '...' : message;
     console.log(`[${accountId}] Sending callback to ${callbackUrl}. Status: ${status}, Message: ${logMessage}`);
     try {
