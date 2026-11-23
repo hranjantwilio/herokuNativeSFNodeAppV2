@@ -1,25 +1,22 @@
 /*
- * Enhanced Node.js Express application for generating Salesforce activity summaries using OpenAI Assistants.
+ * Enhanced Node.js Express application for generating Salesforce activity summaries using the OpenAI Responses API.
  *
  * Features:
- * - Creates/Retrieves OpenAI Assistants on startup using environment variable IDs as preference.
  * - Asynchronous processing with immediate acknowledgement.
  * - Salesforce integration (fetching activities, saving summaries).
- * - OpenAI Assistants API V2 usage.
- * - Dynamic function schema loading (default or from request).
- * - Dynamic tool_choice to force specific function calls (monthly/quarterly).
- * - Conditional input method: Direct JSON in prompt (< threshold) or File Upload (>= threshold).
+ * - OpenAI Responses API usage (replaces the Assistants API, which was sunset on 2026-08-26).
+ * - Function schemas supplied per request (monthJSON / qtrJSON).
+ * - Forced tool_choice to get structured function-call output (monthly/quarterly).
+ * - Conditional input format: pretty JSON in prompt (< threshold) or compact plain text (>= threshold).
  * - Generates summaries per month and aggregates per relevant quarter individually.
  * - Robust error handling and callback mechanism.
- * - Temporary file management.
  */
 
 // --- Dependencies ---
 const express = require('express');
 const jsforce = require('jsforce');
 const dotenv = require('dotenv');
-const { OpenAI, NotFoundError } = require("openai");
-const fs = require("fs-extra"); // Using fs-extra for promise-based file operations and JSON handling
+const { OpenAI } = require("openai");
 const path = require("path");
 const axios = require("axios");
 
@@ -30,28 +27,21 @@ dotenv.config();
 const SF_LOGIN_URL = process.env.SF_LOGIN_URL;
 const PORT = process.env.PORT || 3000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-// --- Assistant IDs are now PREFERRED, creation is fallback ---
-const OPENAI_MONTHLY_ASSISTANT_ID_ENV = process.env.OPENAI_MONTHLY_ASSISTANT_ID;
-const OPENAI_QUARTERLY_ASSISTANT_ID_ENV = process.env.OPENAI_QUARTERLY_ASSISTANT_ID;
 
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o";
 const TIMELINE_SUMMARY_OBJECT_API_NAME = "Timeline_Summary__c"; // Salesforce object API name
-const DIRECT_INPUT_THRESHOLD = 2000; // Max activities for direct JSON input in prompt
-const PROMPT_LENGTH_THRESHOLD = 256000; // Character limit for direct prompt input
-const TEMP_FILE_DIR = path.join(__dirname, 'temp_files'); // Directory for temporary files
+const DIRECT_INPUT_THRESHOLD = 2000; // Max activities for pretty JSON input in prompt
+const PROMPT_LENGTH_THRESHOLD = 256000; // Character limit for pretty JSON input; above this, compact text is used
+
+// --- System Instructions (previously stored on the OpenAI Assistants) ---
+const MONTHLY_INSTRUCTIONS = "You are an AI assistant specialized in analyzing raw Salesforce activity data for a single month and generating structured JSON summaries using the provided function 'generate_monthly_activity_summary'. Apply sub-theme segmentation within the activityMapping as described in the function schema. Focus on extracting key themes, tone, and recommended actions.";
+const QUARTERLY_INSTRUCTIONS = "You are an AI assistant specialized in aggregating pre-summarized monthly Salesforce activity data (provided as JSON in the prompt) into a structured quarterly JSON summary for a specific quarter using the provided function 'generate_quarterly_activity_summary'. Consolidate insights and activity lists accurately based on the input monthly summaries.";
 
 // --- Environment Variable Validation (Essential Vars) ---
 if (!SF_LOGIN_URL || !OPENAI_API_KEY) {
     console.error("FATAL ERROR: Missing required environment variables (SF_LOGIN_URL, OPENAI_API_KEY).");
     process.exit(1);
 }
-
-// --- Global Variables for Final Assistant IDs ---
-// These will be populated during startup by createOrRetrieveAssistant
-let monthlyAssistantId = null;
-let quarterlyAssistantId = null;
-
-
 
 // --- OpenAI Client Initialization ---
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
@@ -62,139 +52,21 @@ app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use(express.static(path.join(__dirname, 'public'))); // Optional: For serving static files
 
-// --- Helper Function to Create or Retrieve Assistant ---
-/**
- * Attempts to retrieve an Assistant by the provided ID (from env var).
- * If not found or no ID provided, creates a new Assistant.
- * @param {OpenAI} openaiClient - The initialized OpenAI client.
- * @param {string|null} assistantIdEnvVar - The Assistant ID from environment variable (preferred).
- * @param {string} assistantName - Name for the Assistant (used if creating).
- * @param {string} assistantInstructions - Instructions for the Assistant (used if creating).
- * @param {Array<object>} assistantToolsConfig - Base tools configuration (e.g., [{ type: "file_search" }, { type: "function" }]). Specific function schemas are NOT passed here.
- * @param {string} assistantModel - Model name (e.g., "gpt-4o").
- * @returns {Promise<string>} The ID of the retrieved or created Assistant.
- * @throws {Error} If retrieval fails (non-404) or creation fails.
- */
-async function createOrRetrieveAssistant(
-    openaiClient,
-    assistantIdEnvVar,
-    assistantName,
-    assistantInstructions,
-    assistantToolsConfig, // Renamed for clarity
-    assistantModel
-) {
-    if (assistantIdEnvVar) {
-        console.log(`Attempting to retrieve Assistant "${assistantName}" using ID: ${assistantIdEnvVar}`);
-        try {
-            const retrievedAssistant = await openaiClient.beta.assistants.retrieve(assistantIdEnvVar);
-            console.log(`Successfully retrieved existing Assistant "${retrievedAssistant.name}" with ID: ${retrievedAssistant.id}`);
-            // Optional: Check if config matches expectations
-            // if (retrievedAssistant.model !== assistantModel) { console.warn(`Retrieved assistant ${assistantName} uses model ${retrievedAssistant.model}, expected ${assistantModel}`); }
-            // if (!retrievedAssistant.tools.some(tool => tool.type === 'function')) { console.warn(`Retrieved assistant ${assistantName} does not have function tool enabled.`); }
-            // if (!retrievedAssistant.tools.some(tool => tool.type === 'file_search')) { console.warn(`Retrieved assistant ${assistantName} does not have file_search tool enabled.`); }
-            return retrievedAssistant.id;
-        } catch (error) {
-            if (error instanceof NotFoundError) {
-                console.warn(`Assistant with ID "${assistantIdEnvVar}" not found. Will proceed to create a new one for "${assistantName}".`);
-            } else {
-                console.error(`Error retrieving Assistant "${assistantName}" (ID: ${assistantIdEnvVar}):`, error);
-                throw new Error(`Failed to retrieve Assistant ${assistantName}: ${error.message}`);
-            }
-        }
-    } else {
-        console.log(`No environment variable ID provided for Assistant "${assistantName}". Proceeding to create a new one.`);
-    }
-
-    // --- Create Assistant if retrieval failed or no ID was provided ---
-    console.log(`Creating new Assistant: ${assistantName}...`);
-    try {
-        // Pass only the base tool types (file_search, function) during creation
-        const newAssistant = await openaiClient.beta.assistants.create({
-            name: assistantName,
-            instructions: assistantInstructions,
-            tools: assistantToolsConfig, // Use the passed base tool config
-            model: assistantModel,
-        });
-        console.log(`Successfully created new Assistant "${newAssistant.name}" with ID: ${newAssistant.id}`);
-        // Construct potential env var name dynamically for the warning message
-        const envVarName = `OPENAI_${assistantName.toUpperCase().replace(/ /g, '_').replace('SALESFORCE_', '')}_ASSISTANT_ID`;
-        console.warn(`--> IMPORTANT: Consider adding this ID to your .env file as ${envVarName}=${newAssistant.id} for future reuse.`);
-        return newAssistant.id;
-    } catch (creationError) {
-        console.error(`Error creating Assistant "${assistantName}":`, creationError);
-        throw new Error(`Failed to create Assistant ${assistantName}: ${creationError.message}`);
-    }
-}
-
 
 // --- Server Startup ---
-// Wrap startup in an async IIFE to allow await for assistant setup
-(async () => {
-    try {
-        console.log("Initializing Assistants...");
-        await fs.ensureDir(TEMP_FILE_DIR); // Ensure temp directory exists
-
-        // Define base tool configuration needed for assistants
-        // These enable the *capabilities*. The specific function *schema* is passed during the run.
-        const assistantBaseTools = [
-             { type: "file_search" }, // Enable file searching capability
-             { type: "function" }     // Enable function calling capability
-        ];
-
-        // --- Setup Monthly Assistant ---
-        monthlyAssistantId = await createOrRetrieveAssistant(
-            openai,
-            OPENAI_MONTHLY_ASSISTANT_ID_ENV,
-            "Salesforce Monthly Summarizer",
-            "You are an AI assistant specialized in analyzing raw Salesforce activity data for a single month and generating structured JSON summaries using the provided function 'generate_monthly_activity_summary'. Apply sub-theme segmentation within the activityMapping as described in the function schema. Focus on extracting key themes, tone, and recommended actions. Use file_search if data is provided as a file.",
-            assistantBaseTools, // Pass base tool config
-            OPENAI_MODEL
-        );
-
-        // --- Setup Quarterly Assistant ---
-        quarterlyAssistantId = await createOrRetrieveAssistant(
-            openai,
-            OPENAI_QUARTERLY_ASSISTANT_ID_ENV,
-            "Salesforce Quarterly Summarizer", // Corrected name
-            "You are an AI assistant specialized in aggregating pre-summarized monthly Salesforce activity data (provided as JSON in the prompt) into a structured quarterly JSON summary for a specific quarter using the provided function 'generate_quarterly_activity_summary'. Consolidate insights and activity lists accurately based on the input monthly summaries.",
-             assistantBaseTools, // Pass base tool config
-             OPENAI_MODEL
-        );
-
-        // Ensure both IDs were successfully obtained
-        if (!monthlyAssistantId || !quarterlyAssistantId) {
-             throw new Error("Failed to obtain valid IDs for one or more Assistants during startup.");
-        }
-
-        // Start the Express server only after assistants are ready
-        app.listen(PORT, () => {
-            console.log("----------------------------------------------------");
-            console.log(`Server running on port ${PORT}`);
-            console.log(`Using OpenAI Model (for new Assistants): ${OPENAI_MODEL}`);
-            console.log(`Using Monthly Assistant ID: ${monthlyAssistantId}`);
-            console.log(`Using Quarterly Assistant ID: ${quarterlyAssistantId}`);
-            console.log(`Direct JSON input threshold: ${DIRECT_INPUT_THRESHOLD} activities`);
-            console.log(`Prompt length threshold for file upload: ${PROMPT_LENGTH_THRESHOLD} characters`);
-            console.log(`Temporary file directory: ${TEMP_FILE_DIR}`);
-            console.log("----------------------------------------------------");
-        });
-
-    } catch (startupError) {
-        console.error("FATAL STARTUP ERROR:", startupError.message);
-        process.exit(1); // Exit if assistant setup fails
-    }
-})();
+app.listen(PORT, () => {
+    console.log("----------------------------------------------------");
+    console.log(`Server running on port ${PORT}`);
+    console.log(`Using OpenAI Model: ${OPENAI_MODEL}`);
+    console.log(`Direct JSON input threshold: ${DIRECT_INPUT_THRESHOLD} activities`);
+    console.log(`Prompt length threshold for compact text input: ${PROMPT_LENGTH_THRESHOLD} characters`);
+    console.log("----------------------------------------------------");
+});
 
 
 // --- Main API Endpoint ---
 app.post('/generatesummary', async (req, res) => {
     console.log("Received /generatesummary request");
-
-    // --- Ensure Assistants are Ready ---
-    if (!monthlyAssistantId || !quarterlyAssistantId) {
-        console.error("Error: Assistants not initialized properly during startup.");
-        return res.status(500).json({ error: "Internal Server Error: Assistants not ready." });
-    }
 
     // --- Authorization ---
     const authHeader = req.headers["authorization"];
@@ -225,9 +97,9 @@ app.post('/generatesummary', async (req, res) => {
 
     // --- Parse Optional JSON Inputs & Function Schemas Safely ---
     let summaryRecordsMap = {};
-    // Find default schemas - these will be used unless overridden
-    //let monthlyFuncSchema = defaultFunctions.find(f => f.name === 'generate_monthly_activity_summary');
-    //let quarterlyFuncSchema = defaultFunctions.find(f => f.name === 'generate_quarterly_activity_summary');
+    // Schemas must be supplied in the request (monthJSON / qtrJSON); there are no server-side defaults
+    let monthlyFuncSchema = null;
+    let quarterlyFuncSchema = null;
 
     try {
         if (summaryMap) {
@@ -261,8 +133,8 @@ app.post('/generatesummary', async (req, res) => {
      // --- Ensure Schemas are Available ---
      if (!monthlyFuncSchema || !quarterlyFuncSchema) {
          // This check ensures that either the defaults were found or valid custom schemas were parsed.
-         console.error("FATAL: Function schemas could not be loaded or parsed correctly.");
-         return res.status(500).send({ error: "Internal server error: Could not load function schemas."});
+         console.error("Bad Request: Function schemas (monthJSON, qtrJSON) were not provided.");
+         return res.status(400).send({ error: "Missing required function schemas (monthJSON, qtrJSON)."});
      }
 
     // --- Acknowledge Request (202 Accepted) ---
@@ -270,7 +142,7 @@ app.post('/generatesummary', async (req, res) => {
     console.log(`Initiating summary processing for Account ID: ${accountId}`);
 
     // --- Start Asynchronous Processing ---
-    // Pass the globally stored, verified/created assistant IDs and the final function schemas
+    // Pass the final function schemas
     processSummary(
         accountId,
         accessToken,
@@ -282,8 +154,6 @@ app.post('/generatesummary', async (req, res) => {
         loggedinUserId,
         monthlyFuncSchema, // Pass the final schema (default or custom)
         quarterlyFuncSchema, // Pass the final schema (default or custom)
-        monthlyAssistantId, // Pass the ID obtained during startup
-        quarterlyAssistantId, // Pass the ID obtained during startup
         sendCallback
     ).catch(async (error) => {
         console.error(`[${accountId}] Unhandled error during background processing:`, error);
@@ -306,7 +176,7 @@ function getQuarterFromMonthIndex(monthIndex) {
 }
 
 // --- Asynchronous Summary Processing Logic ---
-// Function signature now accepts the final assistant IDs and schemas
+// Function signature accepts the final function schemas
 async function processSummary(
     accountId,
     accessToken,
@@ -318,11 +188,9 @@ async function processSummary(
     loggedinUserId,
     finalMonthlyFuncSchema, // Receive the final schema to use
     finalQuarterlyFuncSchema, // Receive the final schema to use
-    finalMonthlyAssistantId, // Receive the final ID
-    finalQuarterlyAssistantId, // Receive the final ID
     sendCallback
 ) {
-    console.log(`[${accountId}] Starting processSummary using Monthly Asst: ${finalMonthlyAssistantId}, Quarterly Asst: ${finalQuarterlyAssistantId}`);
+    console.log(`[${accountId}] Starting processSummary using model: ${OPENAI_MODEL}`);
 
     const conn = new jsforce.Connection({
         instanceUrl: SF_LOGIN_URL,
@@ -356,7 +224,7 @@ async function processSummary(
                         generateSummary(
                             activities,
                             openai,
-                            finalMonthlyAssistantId,
+                            MONTHLY_INSTRUCTIONS,
                             userPromptMonthly,
                             finalMonthlyFuncSchema
                         ).then(monthlySummaryResult => ({
@@ -432,7 +300,7 @@ async function processSummary(
             return generateSummary(
                 null,
                 openai,
-                finalQuarterlyAssistantId,
+                QUARTERLY_INSTRUCTIONS,
                 userPromptQuarterly,
                 finalQuarterlyFuncSchema
             ).then(quarterlySummaryResult => ({ quarterKey, result: quarterlySummaryResult }))
@@ -492,179 +360,106 @@ async function processSummary(
 
 
 // --- OpenAI Summary Generation Function ---
-// This function handles the core interaction with the OpenAI Assistant for a single summary task.
-// It accepts the specific Assistant ID and the detailed function schema for the run.
+// This function handles the core interaction with the OpenAI Responses API for a single summary task.
+// It accepts the system instructions and the detailed function schema to force for this call.
 async function generateSummary(
     activities, // Array of activities or null (if data is in prompt)
     openaiClient,
-    assistantId, // The ID of the specific Assistant to use (monthly or quarterly)
+    instructions, // System instructions (monthly or quarterly)
     userPrompt,
-    functionSchema // The detailed schema for the function to be called in THIS run
+    functionSchema // The detailed schema for the function to be called in THIS request
 ) {
-    let fileId = null;
-    let thread = null;
-    let filePath = null;
+    const logTag = `[${functionSchema.name}]`;
+    let finalUserPrompt = userPrompt;
     let inputMethod = "prompt";
 
     try {
-        // Ensure TEMP_FILE_DIR exists before attempting to write
-        await fs.ensureDir(TEMP_FILE_DIR);
-
-        // 1. Create a new Thread for this interaction
-        thread = await openaiClient.beta.threads.create();
-        console.log(`[Thread ${thread.id}] Created for Assistant ${assistantId}`);
-
-        let finalUserPrompt = userPrompt;
-        let messageAttachments = [];
-
-        // 2. Determine input method: direct prompt vs. file upload
+        // 1. Determine input format: pretty JSON vs. compact plain text
         if (activities && Array.isArray(activities) && activities.length > 0) {
             let potentialFullPrompt;
-            let activitiesJsonString;
             try {
-                 activitiesJsonString = JSON.stringify(activities, null, 2);
+                 const activitiesJsonString = JSON.stringify(activities, null, 2);
                  potentialFullPrompt = `${userPrompt}\n\nHere is the activity data to process:\n\`\`\`json\n${activitiesJsonString}\n\`\`\``;
-                 console.log(`[Thread ${thread.id}] Potential prompt length with direct JSON: ${potentialFullPrompt.length} characters.`);
+                 console.log(`${logTag} Potential prompt length with direct JSON: ${potentialFullPrompt.length} characters.`);
             } catch(stringifyError) {
-                console.error(`[Thread ${thread.id}] Error stringifying activities for length check:`, stringifyError);
+                console.error(`${logTag} Error stringifying activities for length check:`, stringifyError);
                 throw new Error("Failed to stringify activity data for processing.");
             }
 
-            // Check if direct JSON input is feasible based on thresholds
             if (potentialFullPrompt.length < PROMPT_LENGTH_THRESHOLD && activities.length <= DIRECT_INPUT_THRESHOLD) {
                 inputMethod = "direct JSON";
                 finalUserPrompt = potentialFullPrompt;
-                console.log(`[Thread ${thread.id}] Using direct JSON input (Prompt length ${potentialFullPrompt.length} < ${PROMPT_LENGTH_THRESHOLD}, Activities ${activities.length} <= ${DIRECT_INPUT_THRESHOLD}).`);
+                console.log(`${logTag} Using direct JSON input (Prompt length ${potentialFullPrompt.length} < ${PROMPT_LENGTH_THRESHOLD}, Activities ${activities.length} <= ${DIRECT_INPUT_THRESHOLD}).`);
             } else {
-                // Use file upload if thresholds are exceeded
-                inputMethod = "file upload";
-                console.log(`[Thread ${thread.id}] Using file upload (Prompt length ${potentialFullPrompt.length} >= ${PROMPT_LENGTH_THRESHOLD} or Activities ${activities.length} > ${DIRECT_INPUT_THRESHOLD}).`);
-                finalUserPrompt = userPrompt; // Use original prompt when uploading file
+                // Large month: send a compact plain-text rendering inline instead of pretty JSON
+                inputMethod = "compact text";
+                console.log(`${logTag} Using compact text input (Prompt length ${potentialFullPrompt.length} >= ${PROMPT_LENGTH_THRESHOLD} or Activities ${activities.length} > ${DIRECT_INPUT_THRESHOLD}).`);
 
-                // Convert activities to Plain Text for better file_search compatibility
-                let activitiesText = activities.map((activity, index) => {
-                    let activityLines = [`Activity ${index + 1}:`];
-                    for (const [key, value] of Object.entries(activity)) {
-                        let displayValue = value === null || value === undefined ? 'N/A' :
-                                           typeof value === 'object' ? JSON.stringify(value) : String(value);
-                        activityLines.push(`  ${key}: ${displayValue}`);
-                    }
-                    return activityLines.join('\n');
-                }).join('\n\n---\n\n');
+                const activitiesText = activities.map((activity, index) => {
+                    const fields = Object.entries(activity)
+                        .filter(([, value]) => value !== null && value !== undefined && value !== '')
+                        .map(([key, value]) => `${key}: ${typeof value === 'object' ? JSON.stringify(value) : String(value)}`);
+                    return `Activity ${index + 1} | ${fields.join(' | ')}`;
+                }).join('\n');
 
-                // Create temporary file in the designated directory
-                const timestamp = new Date().toISOString().replace(/[:.-]/g, "_");
-                const filename = `salesforce_activities_${timestamp}_${thread.id}.txt`; // Use .txt extension
-                filePath = path.join(TEMP_FILE_DIR, filename);
-
-                await fs.writeFile(filePath, activitiesText);
-                console.log(`[Thread ${thread.id}] Temporary text file generated: ${filePath}`);
-
-                // Upload file to OpenAI
-                const uploadResponse = await openaiClient.files.create({
-                    file: fs.createReadStream(filePath),
-                    purpose: "assistants", // Use 'assistants' purpose for Assistants API v2
-                });
-                fileId = uploadResponse.id;
-                console.log(`[Thread ${thread.id}] File uploaded to OpenAI: ${fileId}`);
-
-                // Attach file to the message using the file_search tool type
-                messageAttachments.push({ file_id: fileId, tools: [{ type: "file_search" }] });
-                console.log(`[Thread ${thread.id}] Attaching file ${fileId} with file_search tool.`);
+                finalUserPrompt = `${userPrompt}\n\nHere is the activity data to process (one activity per line):\n${activitiesText}`;
+                console.log(`${logTag} Compact prompt length: ${finalUserPrompt.length} characters.`);
             }
         } else {
-             console.log(`[Thread ${thread.id}] No activities array provided or array is empty. Using prompt content as is.`);
+             console.log(`${logTag} No activities array provided or array is empty. Using prompt content as is.`);
         }
 
-        // 3. Add the User Message to the Thread
-        const messagePayload = { role: "user", content: finalUserPrompt };
-        if (messageAttachments.length > 0) {
-            messagePayload.attachments = messageAttachments;
-        }
-        const message = await openaiClient.beta.threads.messages.create(thread.id, messagePayload);
-        console.log(`[Thread ${thread.id}] Message added (using ${inputMethod}). ID: ${message.id}`);
-
-        // 4. Run the Assistant, providing the specific function schema and forcing its use
-        console.log(`[Thread ${thread.id}] Starting run, forcing function: ${functionSchema.name}`);
-        const run = await openaiClient.beta.threads.runs.createAndPoll(thread.id, {
-            assistant_id: assistantId,
-            // Pass the *detailed function schema* for THIS specific run.
-            // This tells the assistant the exact structure of the function it can call now.
-            tools: [{ type: "function", function: functionSchema }],
-            // Force the assistant to use THIS specific function.
-            tool_choice: { type: "function", function: { name: functionSchema.name } },
+        // 2. Call the Responses API, forcing the specific function
+        console.log(`${logTag} Calling Responses API (using ${inputMethod}), forcing function: ${functionSchema.name}`);
+        const response = await openaiClient.responses.create({
+            model: OPENAI_MODEL,
+            instructions: instructions,
+            input: finalUserPrompt,
+            tools: [{
+                type: "function",
+                name: functionSchema.name,
+                description: functionSchema.description,
+                parameters: functionSchema.parameters,
+                // Schemas come from Salesforce and may not satisfy strict-mode rules
+                strict: functionSchema.strict ?? false,
+            }],
+            tool_choice: { type: "function", name: functionSchema.name },
+            store: false,
         });
-        console.log(`[Thread ${thread.id}] Run status: ${run.status}`);
+        console.log(`${logTag} Response ${response.id} status: ${response.status}`);
 
-        // 5. Process the Run Outcome
-        if (run.status === 'requires_action') {
-            const toolCalls = run.required_action?.submit_tool_outputs?.tool_calls;
-            if (!toolCalls || toolCalls.length === 0) {
-                 console.error(`[Thread ${thread.id}] Run requires action, but tool call data is missing.`, run);
-                 throw new Error("Function call was expected but not provided by the Assistant.");
-             }
-             // We forced a specific function, so expect only one tool call matching it
-             const toolCall = toolCalls[0];
-             if (toolCall.type !== 'function' || toolCall.function.name !== functionSchema.name) {
-                  console.error(`[Thread ${thread.id}] Assistant required action for unexpected tool. Expected: ${functionSchema.name}, Got: ${toolCall.function?.name || toolCall.type}`);
-                  throw new Error(`Assistant required action for unexpected tool: ${toolCall.function?.name || toolCall.type}`);
-             }
+        // 3. Process the Response
+        if (response.status !== 'completed') {
+            const reason = response.error?.message || response.incomplete_details?.reason || 'Unknown error';
+            console.error(`${logTag} Response did not complete. Status: ${response.status}`, response.error || response.incomplete_details);
+            throw new Error(`OpenAI response failed. Status: ${response.status}. Error: ${reason}`);
+        }
 
-             const rawArgs = toolCall.function.arguments;
-             console.log(`[Thread ${thread.id}] Function call arguments received for ${toolCall.function.name}. Raw (truncated): ${rawArgs.substring(0, 200)}...`);
-             try {
-                 const summaryObj = JSON.parse(rawArgs);
-                 console.log(`[Thread ${thread.id}] Successfully parsed function arguments.`);
-                 // We return the parsed arguments directly as the desired output.
-                 // No need to submit tool outputs back in this workflow.
-                 return summaryObj;
-             } catch (parseError) {
-                 console.error(`[Thread ${thread.id}] Failed to parse function call arguments JSON:`, parseError);
-                 console.error(`[Thread ${thread.id}] Raw arguments received:`, rawArgs);
-                 throw new Error(`Failed to parse function call arguments from AI: ${parseError.message}`);
-             }
-         } else if (run.status === 'completed') {
-              // This state is unexpected when tool_choice mandates a function call.
-              console.warn(`[Thread ${thread.id}] Run completed without requiring function call action, despite tool_choice forcing ${functionSchema.name}. This might indicate an issue with the Assistant's setup or the prompt.`);
-              const messages = await openaiClient.beta.threads.messages.list(run.thread_id, { limit: 1 });
-              const lastMessageContent = messages.data[0]?.content[0]?.text?.value || "No text content found.";
-              console.warn(`[Thread ${thread.id}] Last message content from Assistant: ${lastMessageContent}`);
-              throw new Error(`Assistant run completed without making the required function call to ${functionSchema.name}.`);
-         } else {
-             // Handle other terminal statuses: failed, cancelled, expired
-             console.error(`[Thread ${thread.id}] Run failed or ended unexpectedly. Status: ${run.status}`, run.last_error);
-             const errorMessage = run.last_error ? `${run.last_error.code}: ${run.last_error.message}` : 'Unknown error';
-             throw new Error(`Assistant run failed. Status: ${run.status}. Error: ${errorMessage}`);
-         }
+        const toolCall = response.output.find(item => item.type === 'function_call');
+        if (!toolCall) {
+            console.warn(`${logTag} Response completed without a function call. Text output: ${response.output_text || 'No text content found.'}`);
+            throw new Error(`Model completed without making the required function call to ${functionSchema.name}.`);
+        }
+        if (toolCall.name !== functionSchema.name) {
+            console.error(`${logTag} Unexpected function call. Expected: ${functionSchema.name}, Got: ${toolCall.name}`);
+            throw new Error(`Model called unexpected function: ${toolCall.name}`);
+        }
+
+        const rawArgs = toolCall.arguments;
+        console.log(`${logTag} Function call arguments received. Raw (truncated): ${rawArgs.substring(0, 200)}...`);
+        try {
+            const summaryObj = JSON.parse(rawArgs);
+            console.log(`${logTag} Successfully parsed function arguments.`);
+            return summaryObj;
+        } catch (parseError) {
+            console.error(`${logTag} Failed to parse function call arguments JSON:`, parseError);
+            console.error(`${logTag} Raw arguments received:`, rawArgs);
+            throw new Error(`Failed to parse function call arguments from AI: ${parseError.message}`);
+        }
 
     } catch (error) {
-        console.error(`[Thread ${thread?.id || 'N/A'}] Error in generateSummary: ${error.message}`, error);
+        console.error(`${logTag} Error in generateSummary: ${error.message}`, error);
         throw error; // Re-throw to be caught by the calling function (processSummary)
-    } finally {
-        // 6. Cleanup: Delete temporary file and OpenAI file
-        if (filePath) {
-            try {
-                await fs.unlink(filePath);
-                console.log(`[Thread ${thread?.id || 'N/A'}] Deleted temporary file: ${filePath}`);
-            } catch (unlinkError) {
-                console.error(`[Thread ${thread?.id || 'N/A'}] Error deleting temporary file ${filePath}:`, unlinkError);
-            }
-        }
-        if (fileId) { // If a file was uploaded to OpenAI
-            try {
-                await openaiClient.files.del(fileId);
-                console.log(`[Thread ${thread?.id || 'N/A'}] Deleted OpenAI file: ${fileId}`);
-            } catch (deleteError) {
-                 // Ignore 404 errors as the file might have been deleted already
-                 if (!(deleteError instanceof NotFoundError || deleteError?.status === 404)) {
-                    console.error(`[Thread ${thread?.id || 'N/A'}] Error deleting OpenAI file ${fileId}:`, deleteError.message || deleteError);
-                 } else {
-                     console.log(`[Thread ${thread?.id || 'N/A'}] OpenAI file ${fileId} already deleted or not found.`);
-                 }
-            }
-        }
-        // Optional: Delete the thread if resource management is critical
-        // if (thread) { try { await openaiClient.beta.threads.del(thread.id); console.log(`[Thread ${thread.id}] Deleted thread.`); } catch (e) { /* ignore */ } }
     }
 }
 
