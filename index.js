@@ -8,6 +8,7 @@
  * - Function schemas supplied per request (monthJSON / qtrJSON).
  * - Forced tool_choice to get structured function-call output (monthly/quarterly).
  * - Conditional input format: pretty JSON in prompt (< threshold) or compact plain text (>= threshold).
+ * - Months too large for the context window are summarized in chunks and merged.
  * - Generates summaries per month and aggregates per relevant quarter individually.
  * - Robust error handling and callback mechanism.
  */
@@ -32,6 +33,10 @@ const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o";
 const TIMELINE_SUMMARY_OBJECT_API_NAME = "Timeline_Summary__c"; // Salesforce object API name
 const DIRECT_INPUT_THRESHOLD = 2000; // Max activities for pretty JSON input in prompt
 const PROMPT_LENGTH_THRESHOLD = 256000; // Character limit for pretty JSON input; above this, compact text is used
+// Max characters of compact activity text per request. gpt-4o's 128k-token window is roughly 400k characters;
+// this leaves room for instructions, the function schema and the output. Lower it for smaller-context models.
+const MAX_CHUNK_CHARS = parseInt(process.env.MAX_CHUNK_CHARS, 10) || 250000;
+const MAX_FIELD_CHARS = 4000; // Per-field cap in compact text (long email bodies / quoted threads)
 
 // --- System Instructions (previously stored on the OpenAI Assistants) ---
 const MONTHLY_INSTRUCTIONS = "You are an AI assistant specialized in analyzing raw Salesforce activity data for a single month and generating structured JSON summaries using the provided function 'generate_monthly_activity_summary'. Apply sub-theme segmentation within the activityMapping as described in the function schema. Focus on extracting key themes, tone, and recommended actions.";
@@ -60,6 +65,7 @@ app.listen(PORT, () => {
     console.log(`Using OpenAI Model: ${OPENAI_MODEL}`);
     console.log(`Direct JSON input threshold: ${DIRECT_INPUT_THRESHOLD} activities`);
     console.log(`Prompt length threshold for compact text input: ${PROMPT_LENGTH_THRESHOLD} characters`);
+    console.log(`Max characters per chunk for large months: ${MAX_CHUNK_CHARS}`);
     console.log("----------------------------------------------------");
 });
 
@@ -362,6 +368,7 @@ async function processSummary(
 // --- OpenAI Summary Generation Function ---
 // This function handles the core interaction with the OpenAI Responses API for a single summary task.
 // It accepts the system instructions and the detailed function schema to force for this call.
+// Months too large for one request are summarized in chunks, then the partial summaries are merged.
 async function generateSummary(
     activities, // Array of activities or null (if data is in prompt)
     openaiClient,
@@ -370,96 +377,148 @@ async function generateSummary(
     functionSchema // The detailed schema for the function to be called in THIS request
 ) {
     const logTag = `[${functionSchema.name}]`;
-    let finalUserPrompt = userPrompt;
-    let inputMethod = "prompt";
 
     try {
-        // 1. Determine input format: pretty JSON vs. compact plain text
-        if (activities && Array.isArray(activities) && activities.length > 0) {
-            let potentialFullPrompt;
-            try {
-                 const activitiesJsonString = JSON.stringify(activities, null, 2);
-                 potentialFullPrompt = `${userPrompt}\n\nHere is the activity data to process:\n\`\`\`json\n${activitiesJsonString}\n\`\`\``;
-                 console.log(`${logTag} Potential prompt length with direct JSON: ${potentialFullPrompt.length} characters.`);
-            } catch(stringifyError) {
-                console.error(`${logTag} Error stringifying activities for length check:`, stringifyError);
-                throw new Error("Failed to stringify activity data for processing.");
-            }
-
-            if (potentialFullPrompt.length < PROMPT_LENGTH_THRESHOLD && activities.length <= DIRECT_INPUT_THRESHOLD) {
-                inputMethod = "direct JSON";
-                finalUserPrompt = potentialFullPrompt;
-                console.log(`${logTag} Using direct JSON input (Prompt length ${potentialFullPrompt.length} < ${PROMPT_LENGTH_THRESHOLD}, Activities ${activities.length} <= ${DIRECT_INPUT_THRESHOLD}).`);
-            } else {
-                // Large month: send a compact plain-text rendering inline instead of pretty JSON
-                inputMethod = "compact text";
-                console.log(`${logTag} Using compact text input (Prompt length ${potentialFullPrompt.length} >= ${PROMPT_LENGTH_THRESHOLD} or Activities ${activities.length} > ${DIRECT_INPUT_THRESHOLD}).`);
-
-                const activitiesText = activities.map((activity, index) => {
-                    const fields = Object.entries(activity)
-                        .filter(([, value]) => value !== null && value !== undefined && value !== '')
-                        .map(([key, value]) => `${key}: ${typeof value === 'object' ? JSON.stringify(value) : String(value)}`);
-                    return `Activity ${index + 1} | ${fields.join(' | ')}`;
-                }).join('\n');
-
-                finalUserPrompt = `${userPrompt}\n\nHere is the activity data to process (one activity per line):\n${activitiesText}`;
-                console.log(`${logTag} Compact prompt length: ${finalUserPrompt.length} characters.`);
-            }
-        } else {
-             console.log(`${logTag} No activities array provided or array is empty. Using prompt content as is.`);
+        if (!activities || !Array.isArray(activities) || activities.length === 0) {
+            console.log(`${logTag} No activities array provided or array is empty. Using prompt content as is.`);
+            return await callFunction(openaiClient, instructions, userPrompt, functionSchema, logTag);
         }
 
-        // 2. Call the Responses API, forcing the specific function
-        console.log(`${logTag} Calling Responses API (using ${inputMethod}), forcing function: ${functionSchema.name}`);
-        const response = await openaiClient.responses.create({
-            model: OPENAI_MODEL,
-            instructions: instructions,
-            input: finalUserPrompt,
-            tools: [{
-                type: "function",
-                name: functionSchema.name,
-                description: functionSchema.description,
-                parameters: functionSchema.parameters,
-                // Schemas come from Salesforce and may not satisfy strict-mode rules
-                strict: functionSchema.strict ?? false,
-            }],
-            tool_choice: { type: "function", name: functionSchema.name },
-            store: false,
+        // 1. Small enough: send pretty JSON in a single request
+        const activitiesJsonString = JSON.stringify(activities, null, 2);
+        const fullPrompt = `${userPrompt}\n\nHere is the activity data to process:\n\`\`\`json\n${activitiesJsonString}\n\`\`\``;
+        console.log(`${logTag} Potential prompt length with direct JSON: ${fullPrompt.length} characters.`);
+        if (fullPrompt.length < PROMPT_LENGTH_THRESHOLD && activities.length <= DIRECT_INPUT_THRESHOLD) {
+            console.log(`${logTag} Using direct JSON input (${activities.length} activities).`);
+            return await callFunction(openaiClient, instructions, fullPrompt, functionSchema, logTag);
+        }
+
+        // 2. Large: render compact one-line-per-activity text and pack it into chunks that fit the context window
+        const lines = activities.map((activity, index) => {
+            const fields = Object.entries(activity)
+                .filter(([, value]) => value !== null && value !== undefined && value !== '')
+                .map(([key, value]) => {
+                    let text = typeof value === 'object' ? JSON.stringify(value) : String(value);
+                    text = text.replace(/\s+/g, ' ');
+                    if (text.length > MAX_FIELD_CHARS) text = text.substring(0, MAX_FIELD_CHARS) + ' …[truncated]';
+                    return `${key}: ${text}`;
+                });
+            return `Activity ${index + 1} | ${fields.join(' | ')}`;
         });
-        console.log(`${logTag} Response ${response.id} status: ${response.status}`);
 
-        // 3. Process the Response
-        if (response.status !== 'completed') {
-            const reason = response.error?.message || response.incomplete_details?.reason || 'Unknown error';
-            console.error(`${logTag} Response did not complete. Status: ${response.status}`, response.error || response.incomplete_details);
-            throw new Error(`OpenAI response failed. Status: ${response.status}. Error: ${reason}`);
+        const chunks = [];
+        let current = [];
+        let currentLength = 0;
+        for (const line of lines) {
+            if (current.length > 0 && currentLength + line.length + 1 > MAX_CHUNK_CHARS) {
+                chunks.push(current);
+                current = [];
+                currentLength = 0;
+            }
+            current.push(line);
+            currentLength += line.length + 1;
+        }
+        if (current.length > 0) chunks.push(current);
+        console.log(`${logTag} Using compact text input: ${activities.length} activities in ${chunks.length} chunk(s).`);
+
+        const buildPrompt = (chunkLines, note) => `${userPrompt}${note}\n\nHere is the activity data to process (one activity per line):\n${chunkLines.join('\n')}`;
+
+        if (chunks.length === 1) {
+            return await callFunction(openaiClient, instructions, buildPrompt(chunks[0], ''), functionSchema, logTag);
         }
 
-        const toolCall = response.output.find(item => item.type === 'function_call');
-        if (!toolCall) {
-            console.warn(`${logTag} Response completed without a function call. Text output: ${response.output_text || 'No text content found.'}`);
-            throw new Error(`Model completed without making the required function call to ${functionSchema.name}.`);
-        }
-        if (toolCall.name !== functionSchema.name) {
-            console.error(`${logTag} Unexpected function call. Expected: ${functionSchema.name}, Got: ${toolCall.name}`);
-            throw new Error(`Model called unexpected function: ${toolCall.name}`);
+        // 3. Summarize each chunk (sequentially, to stay within rate limits), then merge
+        const partials = [];
+        for (let i = 0; i < chunks.length; i++) {
+            const note = `\n\nNOTE: This is part ${i + 1} of ${chunks.length} of this month's activities (${chunks[i].length} of ${activities.length} activities). Summarize only this part.`;
+            partials.push(await callFunction(openaiClient, instructions, buildPrompt(chunks[i], note), functionSchema, `${logTag}[part ${i + 1}/${chunks.length}]`));
         }
 
-        const rawArgs = toolCall.arguments;
-        console.log(`${logTag} Function call arguments received. Raw (truncated): ${rawArgs.substring(0, 200)}...`);
-        try {
-            const summaryObj = JSON.parse(rawArgs);
-            console.log(`${logTag} Successfully parsed function arguments.`);
-            return summaryObj;
-        } catch (parseError) {
-            console.error(`${logTag} Failed to parse function call arguments JSON:`, parseError);
-            console.error(`${logTag} Raw arguments received:`, rawArgs);
-            throw new Error(`Failed to parse function call arguments from AI: ${parseError.message}`);
+        // Merge in rounds so the merge prompt itself never exceeds the chunk budget
+        let summaries = partials;
+        let round = 1;
+        while (summaries.length > 1) {
+            const batches = [];
+            let batch = [];
+            let batchLength = 0;
+            for (const summary of summaries) {
+                const size = JSON.stringify(summary).length;
+                if (batch.length > 0 && batchLength + size > MAX_CHUNK_CHARS) {
+                    batches.push(batch);
+                    batch = [];
+                    batchLength = 0;
+                }
+                batch.push(summary);
+                batchLength += size;
+            }
+            if (batch.length > 0) batches.push(batch);
+
+            const merged = [];
+            for (let i = 0; i < batches.length; i++) {
+                if (batches[i].length === 1) { merged.push(batches[i][0]); continue; }
+                const mergePrompt = `${userPrompt}\n\nThe activities for this month (${activities.length} in total) were too many to process at once, so they were summarized in parts. Combine the ${batches[i].length} partial summaries below into ONE summary, using the same structure. Merge overlapping themes, keep all distinct key points, and sum any counts.\n\`\`\`json\n${JSON.stringify(batches[i], null, 2)}\n\`\`\``;
+                merged.push(await callFunction(openaiClient, instructions, mergePrompt, functionSchema, `${logTag}[merge ${round}.${i + 1}/${batches.length}]`));
+            }
+            if (merged.length === summaries.length) {
+                throw new Error("Partial summaries are too large to merge within MAX_CHUNK_CHARS.");
+            }
+            summaries = merged;
+            round++;
         }
+        return summaries[0];
 
     } catch (error) {
         console.error(`${logTag} Error in generateSummary: ${error.message}`, error);
         throw error; // Re-throw to be caught by the calling function (processSummary)
+    }
+}
+
+// Calls the Responses API once, forcing the given function, and returns the parsed function arguments
+async function callFunction(openaiClient, instructions, input, functionSchema, logTag) {
+    console.log(`${logTag} Calling Responses API (${input.length} characters), forcing function: ${functionSchema.name}`);
+    const response = await openaiClient.responses.create({
+        model: OPENAI_MODEL,
+        instructions: instructions,
+        input: input,
+        tools: [{
+            type: "function",
+            name: functionSchema.name,
+            description: functionSchema.description,
+            parameters: functionSchema.parameters,
+            // Schemas come from Salesforce and may not satisfy strict-mode rules
+            strict: functionSchema.strict ?? false,
+        }],
+        tool_choice: { type: "function", name: functionSchema.name },
+        store: false,
+    });
+    console.log(`${logTag} Response ${response.id} status: ${response.status}`);
+
+    if (response.status !== 'completed') {
+        const reason = response.error?.message || response.incomplete_details?.reason || 'Unknown error';
+        console.error(`${logTag} Response did not complete. Status: ${response.status}`, response.error || response.incomplete_details);
+        throw new Error(`OpenAI response failed. Status: ${response.status}. Error: ${reason}`);
+    }
+
+    const toolCall = response.output.find(item => item.type === 'function_call');
+    if (!toolCall) {
+        console.warn(`${logTag} Response completed without a function call. Text output: ${response.output_text || 'No text content found.'}`);
+        throw new Error(`Model completed without making the required function call to ${functionSchema.name}.`);
+    }
+    if (toolCall.name !== functionSchema.name) {
+        console.error(`${logTag} Unexpected function call. Expected: ${functionSchema.name}, Got: ${toolCall.name}`);
+        throw new Error(`Model called unexpected function: ${toolCall.name}`);
+    }
+
+    const rawArgs = toolCall.arguments;
+    console.log(`${logTag} Function call arguments received. Raw (truncated): ${rawArgs.substring(0, 200)}...`);
+    try {
+        const summaryObj = JSON.parse(rawArgs);
+        console.log(`${logTag} Successfully parsed function arguments.`);
+        return summaryObj;
+    } catch (parseError) {
+        console.error(`${logTag} Failed to parse function call arguments JSON:`, parseError);
+        console.error(`${logTag} Raw arguments received:`, rawArgs);
+        throw new Error(`Failed to parse function call arguments from AI: ${parseError.message}`);
     }
 }
 
